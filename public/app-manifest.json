@@ -1,0 +1,17 @@
+{
+  "name": "旅行柴柴 Tripi Pro — AI Travel Navigator",
+  "short_name": "Tripi Pro",
+  "description": "Smart trip planning with interactive maps, real-time info (weather, flights, tickets).",
+  "widget_url": "https://YOUR-DOMAIN/widget",
+  "privacy_url": "https://YOUR-DOMAIN/privacy",
+  "terms_url": "https://YOUR-DOMAIN/terms",
+  "category": "Travel",
+  "permissions": {
+    "login_required": false,
+    "scopes": []
+  },
+  "icons": {
+    "512": "/icons/icon512.png",
+    "banner": "/icons/banner1200.png"
+  }
+}

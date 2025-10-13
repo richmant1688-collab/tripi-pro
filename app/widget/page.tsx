@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { readInitParams, listen, send } from '@/lib/apps-bridge';
+import { readInitParams, listen, send } from '../../lib/apps-bridge';
 
 type POI = { name: string; lat: number; lng: number; address?: string; rating?: number; };
 type DayPlan = { day: number; city: string; pois: POI[]; };

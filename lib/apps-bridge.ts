@@ -1,43 +1,42 @@
+// lib/apps-bridge.ts
+export type BridgeInit = { origin?: string; destination?: string; days?: number };
 
-export type InitParams = { origin?: string; destination?: string; days?: number };
+type InMsg =
+  | { type: 'init'; payload: BridgeInit }
+  | { type: 'set'; payload: Partial<BridgeInit> }
+  | { type: 'ping' };
 
-export function readInitParams(): InitParams {
+type OutMsg =
+  | { type: 'ready' }
+  | { type: 'result'; payload: BridgeInit }
+  | { type: 'error'; message: string };
+
+export function readInitParams(): BridgeInit {
+  if (typeof window === 'undefined') return {};
   const u = new URL(window.location.href);
-  const p = Object.fromEntries(u.searchParams.entries());
-  const days = p.days ? parseInt(p.days, 10) : undefined;
+  const daysStr = u.searchParams.get('days') ?? undefined;
   return {
-    origin: p.origin,
-    destination: p.destination,
-    days: Number.isFinite(days) ? days : undefined,
+    origin: u.searchParams.get('origin') ?? undefined,
+    destination: u.searchParams.get('destination') ?? undefined,
+    days: daysStr ? Number(daysStr) : undefined,
   };
 }
 
-export type IncomingMessage =
-  | { type: 'init'; payload: InitParams }
-  | { type: 'set'; payload: InitParams }
-  | { type: 'focus' }
-  | { type: 'ping' };
-
-export type OutgoingMessage =
-  | { type: 'ready' }
-  | { type: 'result'; payload: any }
-  | { type: 'error'; message: string }
-  | { type: 'log'; payload: any };
-
-export function listen(handler: (msg: IncomingMessage) => void) {
-  window.addEventListener('message', (ev) => {
-    try {
-      if (typeof ev.data !== 'object' || !ev.data) return;
-      if (!('type' in ev.data)) return;
-      handler(ev.data as IncomingMessage);
-    } catch (e) {}
-  });
+export function listen(handler: (msg: InMsg) => void) {
+  if (typeof window === 'undefined') return;
+  const fn = (e: MessageEvent) => {
+    const msg = e.data as InMsg;
+    if (!msg || typeof msg !== 'object' || !('type' in msg)) return;
+    handler(msg);
+  };
+  window.addEventListener('message', fn);
+  // 回傳解除註冊
+  return () => window.removeEventListener('message', fn);
 }
 
-export function send(msg: OutgoingMessage) {
-  try {
-    if (window.parent && window.parent !== window) {
-      window.parent.postMessage(msg, '*');
-    }
-  } catch {}
+export function send(msg: OutMsg) {
+  if (typeof window === 'undefined') return;
+  // 發給父層（被 iframe 時）以及自己（自測）
+  try { window.parent.postMessage(msg, '*'); } catch {}
+  try { window.postMessage(msg, '*'); } catch {}
 }

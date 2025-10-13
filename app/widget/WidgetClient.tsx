@@ -31,7 +31,16 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
 
 export default function WidgetClient() {
   // ---- 地圖容器 ----
-  const mapRef = useRef<HTMLDivElement>(null);
+  <div
+  id="map"
+  ref={mapRef}
+  style={{
+    width: '100%',
+    height: '60vh',        // 👈 給一個明確高度
+    border: '1px solid #e5e7eb',
+    borderRadius: 12
+  }}
+/>
 
   // ---- Google / Leaflet 狀態 ----
   const [usingGoogle, setUsingGoogle] = useState(false);

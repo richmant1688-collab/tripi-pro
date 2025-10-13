@@ -30,13 +30,13 @@ export function listen(handler: (msg: InMsg) => void) {
     handler(msg);
   };
   window.addEventListener('message', fn);
-  // ¦^¶Ç¸Ñ°£µù¥U
+  // å›å‚³è§£é™¤è¨»å†Š
   return () => window.removeEventListener('message', fn);
 }
 
 export function send(msg: OutMsg) {
   if (typeof window === 'undefined') return;
-  // µoµ¹¤÷¼h¡]³Q iframe ®É¡^¥H¤Î¦Û¤v¡]¦Û´ú¡^
+  // ç™¼çµ¦çˆ¶å±¤ï¼ˆè¢« iframe æ™‚ï¼‰ä»¥åŠè‡ªå·±ï¼ˆè‡ªæ¸¬ï¼‰
   try { window.parent.postMessage(msg, '*'); } catch {}
   try { window.postMessage(msg, '*'); } catch {}
 }

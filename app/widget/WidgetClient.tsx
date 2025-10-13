@@ -30,17 +30,30 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
 }
 
 export default function WidgetClient() {
-  // ---- 地圖容器 ----
-  <div
-  id="map"
-  ref={mapRef}
-  style={{
-    width: '100%',
-    height: '60vh',        // 👈 給一個明確高度
-    border: '1px solid #e5e7eb',
-    borderRadius: 12
-  }}
-/>
+  const mapRef = useRef<HTMLDivElement>(null); // ✅ 加這行
+
+  useEffect(() => {
+    if (!mapRef.current) return;
+    // 你的 Google Maps 初始化程式碼
+    const map = new google.maps.Map(mapRef.current, {
+      center: { lat: 23.6978, lng: 120.9605 },
+      zoom: 7,
+    });
+  }, []);
+
+  return (
+    <div
+      id="map"
+      ref={mapRef}
+      style={{
+        width: '100%',
+        height: '60vh',
+        border: '1px solid #e5e7eb',
+        borderRadius: 12,
+      }}
+    />
+  );
+}
 
   // ---- Google / Leaflet 狀態 ----
   const [usingGoogle, setUsingGoogle] = useState(false);

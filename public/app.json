@@ -2,9 +2,11 @@
   "schema_version": "v1",
   "name_for_human": "旅行柴柴 Tripi Pro",
   "name_for_model": "tripi_pro_travel_planner",
-  "description_for_human": "輸入起點、終點與天數，一鍵產生旅遊行程、距離時間與路線，支援 Google Maps。",
-  "description_for_model": "Plan multi-day travel itineraries between two cities using the /api/plan endpoint. Returns polyline path, start/end, distanceText, durationText, and POIs.",
-  "auth": { "type": "none" },
+  "description_for_human": "輸入起點、終點與天數，一鍵產生旅遊行程，含距離時間與路線（支援 Google Maps）。",
+  "description_for_model": "Plan multi-day travel itineraries between two cities using the /api/plan endpoint. Return route polyline, start/end addresses and coordinates, distanceText, durationText, and up to 25 POIs. Inputs: origin (string), destination (string), days (1-14).",
+  "auth": {
+    "type": "none"
+  },
   "api": {
     "type": "openapi",
     "url": "https://tripi-pro.vercel.app/openapi.yaml"

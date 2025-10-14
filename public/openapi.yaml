@@ -1,45 +1,43 @@
-﻿openapi: 3.0.1
+openapi: 3.1.0
 info:
-  title: Tripi Pro Travel Planner API
+  title: Tripi Pro API
   version: "1.0.0"
   description: |
-    Tripi Pro 幫助用戶規劃多日旅遊行程。
-    傳入起點、終點與天數，回傳距離、時間、路線（polyline）與每日景點。
+    Plan multi-day travel itineraries between two cities.
+    POST /api/plan returns polyline, start/end, distanceText, durationText, and POIs.
+
 servers:
   - url: "https://tripi-pro.vercel.app"
 
 paths:
   /api/plan:
     post:
+      summary: Create a trip plan
+      description: >
+        Generate a multi-day route and POIs between origin and destination.
       operationId: createPlan
-      summary: 建立旅遊行程
-      description: |
-        傳入起點（origin）、終點（destination）與天數（days），
-        回傳距離、時間、路線座標與每日景點資訊。
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [origin, destination, days]
               properties:
                 origin:
                   type: string
-                  description: 起點地名或地址
                   example: 台北
                 destination:
                   type: string
-                  description: 終點地名或地址
                   example: 墾丁
                 days:
                   type: integer
                   minimum: 1
                   maximum: 14
                   example: 5
+              required: [origin, destination, days]
       responses:
         "200":
-          description: 成功回傳行程
+          description: Plan generated
           content:
             application/json:
               schema:
@@ -48,48 +46,39 @@ paths:
                   provider:
                     type: string
                     enum: [google, osrm]
-                    example: google
                   polyline:
                     type: array
-                    description: 路線座標序列 [lat, lng]
                     items:
                       type: array
                       items:
                         type: number
                       minItems: 2
                       maxItems: 2
-                    example:
-                      - [25.033, 121.565]
-                      - [23.6978, 120.9605]
                   start:
                     type: object
                     properties:
-                      lat: { type: number, example: 25.033 }
-                      lng: { type: number, example: 121.565 }
-                      address: { type: string, example: 台北市 }
+                      lat: { type: number }
+                      lng: { type: number }
+                      address: { type: string }
                   end:
                     type: object
                     properties:
-                      lat: { type: number, example: 21.946 }
-                      lng: { type: number, example: 120.781 }
-                      address: { type: string, example: 墾丁 }
-                  distanceText:
-                    type: string
-                    example: "455 公里"
-                  durationText:
-                    type: string
-                    example: "5 小時 26 分鐘"
+                      lat: { type: number }
+                      lng: { type: number }
+                      address: { type: string }
+                  distanceText: { type: string }
+                  durationText: { type: string }
                   pois:
                     type: array
-                    description: 建議景點（前 25 筆）
                     items:
                       type: object
                       properties:
-                        name: { type: string, example: 鵝鑾鼻燈塔 }
-                        address: { type: string, example: 屏東縣恆春鎮鵝鑾里 }
-                        lat: { type: number, example: 21.907 }
-                        lng: { type: number, example: 120.853 }
+                        name: { type: string }
+                        lat: { type: number }
+                        lng: { type: number }
+                        address: { type: string }
+                        rating: { type: number }
         "400":
-          description: 請求參數錯誤
+          description: Bad request
         "500":
-          description: 伺服器錯誤
+          description: Server error

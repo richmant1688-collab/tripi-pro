@@ -6,7 +6,7 @@ info:
     Tripi Pro 幫助用戶規劃多日旅遊行程。
     傳入起點、終點與天數，回傳距離、時間、路線（polyline）與每日景點。
 servers:
-  - url: https://tripi-pro.vercel.app
+  - url: "https://tripi-pro.vercel.app"
 
 paths:
   /api/plan:

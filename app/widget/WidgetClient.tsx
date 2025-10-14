@@ -1,7 +1,7 @@
 ﻿'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { readInitParams, listen, send } from '@/lib/apps-bridge';
+import { readInitParams, listen, send } from '../../lib/apps-bridge';
 
 type POI = { name: string; lat: number; lng: number; address?: string; rating?: number };
 type DayPlan = { day: number; city: string; pois: POI[] };

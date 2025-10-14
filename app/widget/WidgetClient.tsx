@@ -251,9 +251,16 @@ export default function WidgetClient() {
     <div className="min-h-screen w-full bg-white p-3 lg:p-6">
       <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-[1fr_420px] gap-6 items-start">
         <div className="relative w-full aspect-[16/10] rounded-xl shadow overflow-hidden border border-slate-200">
-          <div ref={mapRef} className="absolute inset-0" />
+          <div
+            ref={mapRef}
+            id="map"
+            style={{
+              width: '100%',
+              height: '60vh',
+              minHeight: 400,
+            }}
+          />
         </div>
-
         <div className="space-y-6">
           <Panel title="旅行條件">
             <div className="grid grid-cols-1 gap-3">

@@ -1,4 +1,6 @@
-﻿'use client';
+﻿/// <reference types="@types/google.maps" />
+
+'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { readInitParams, listen, send } from '../../lib/apps-bridge';

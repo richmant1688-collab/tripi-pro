@@ -412,10 +412,10 @@ export default function WidgetClient() {
       if (details.formatted_address) parts.push('<div style="font-size:12px;margin-top:6px">地址：' + escapeHtml(details.formatted_address) + '</div>');
       if (details.formatted_phone_number) parts.push('<div style="font-size:12px">電話：' + escapeHtml(details.formatted_phone_number) + '</div>');
       if (details.website) parts.push('<div style="font-size:12px"><a href="' + details.website + '" target="_blank" rel="noopener noreferrer">官方網站</a></div>');
-      if (details.opening_hours?.weekday_text) {
-        const oh = (details.opening_hours.weekday_text as string[]).slice(0, 3).join('<br/>');
-        parts.push('<div style="font-size:12px;margin-top:6px">營業時間：<br/>' + oh + '</div>');
-      }
+    if (details.opening_hours?.weekday_text) {
+      const ohAll = (details.opening_hours.weekday_text as string[]).join('<br/>'); // 顯示全部 7 天
+      parts.push('<div style="font-size:12px;margin-top:6px">營業時間：<br/>' + ohAll + '</div>');
+    }
     }
     parts.push('</div>');
     return parts.join('');

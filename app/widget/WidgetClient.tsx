@@ -130,7 +130,8 @@ export default function WidgetClient() {
 
   // Nearby controls
   const [types, setTypes] = useState<string[]>(['tourist_attraction', 'restaurant']);
-  const [radius, setRadius] = useState(1500);
+  const [radius, setRadius] = useState(1500);          // 實際使用的半徑（number）
+  const [radiusInput, setRadiusInput] = useState('1500'); // 顯示用字串（可清空）
   const [keyword, setKeyword] = useState('');
   const [showCircle, setShowCircle] = useState(true);
   const [autoUpdateOnDrag, setAutoUpdateOnDrag] = useState(true);
@@ -582,8 +583,20 @@ export default function WidgetClient() {
                   type="number"
                   min={200}
                   max={5000}
-                  value={radius}
-                  onChange={(e) => setRadius(parseInt(e.target.value || '500', 10))}
+                  value={radiusInput}
+                  onChange={(e) => {
+                    setRadiusInput(e.target.value); // 允許清空
+                  }}
+                  onBlur={() => {
+                    const n = parseInt(radiusInput, 10);
+                    if (isNaN(n)) {
+                      setRadiusInput(String(radius)); // 還原
+                      return;
+                    }
+                    const clamped = Math.max(200, Math.min(5000, n));
+                    setRadius(clamped);
+                    setRadiusInput(String(clamped));
+                  }}
                   className="border rounded-xl px-3 py-2 w-32 ml-2"
                 />
               </div>

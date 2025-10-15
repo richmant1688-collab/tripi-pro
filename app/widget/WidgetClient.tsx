@@ -83,14 +83,17 @@ function useGoogleMaps(apiKey?: string) {
 
 // ---------------- Helpers ----------------
 
-function userBlueIcon(): google.maps.Symbol {
+// 藍色大頭針（像預設紅色，但換成藍色）
+function userBluePinIcon(): google.maps.Icon {
+  const svg =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24">' +
+    '<path d="M12 2c-4.97 0-9 3.88-9 8.67 0 6.5 9 13.66 9 13.66s9-7.16 9-13.66C21 5.88 16.97 2 12 2z" fill="#2563EB" stroke="#1E3A8A" stroke-width="1.2"/>' +
+    '<circle cx="12" cy="10" r="3.2" fill="#ffffff"/>' +
+    '</svg>';
   return {
-    path: google.maps.SymbolPath.CIRCLE,
-    scale: 8,
-    fillColor: '#2563EB', // blue-600
-    fillOpacity: 1,
-    strokeColor: '#FFFFFF',
-    strokeWeight: 2,
+    url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
+    scaledSize: new google.maps.Size(36, 36),
+    anchor: new google.maps.Point(18, 34), // 尖端
   };
 }
 
@@ -103,11 +106,11 @@ export default function WidgetClient() {
   const routePolylineRef = useRef<google.maps.Polyline | null>(null); // 路線折線
   const routeMarkersRef = useRef<google.maps.Marker[]>([]); // S/E 兩點
   const poiMarkersRef = useRef<google.maps.Marker[]>([]); // 附近探索 POI（也包含初始行程POI）
-  const userMarkerRef = useRef<google.maps.Marker | null>(null); // 📍 使用者位置（藍色)
+  const userMarkerRef = useRef<google.maps.Marker | null>(null); // 目前位置（藍色針）
   const searchCircleRef = useRef<google.maps.Circle | null>(null); // 搜尋範圍圓（藍系）
   const mapIdleListenerRef = useRef<google.maps.MapsEventListener | null>(null);
   const watchIdRef = useRef<number | null>(null);
-  const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null); // 共用 InfoWindow（避免多個同時開）
+  const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null); // 共用 InfoWindow
 
   // Trip inputs
   const [origin, setOrigin] = useState('台北');
@@ -159,7 +162,7 @@ export default function WidgetClient() {
           userMarkerRef.current = new google.maps.Marker({
             position: userPos,
             map: mapInst.current!,
-            icon: userBlueIcon(),
+            icon: userBluePinIcon(),
             title: '目前位置',
             zIndex: 9999,
           });
@@ -348,7 +351,7 @@ export default function WidgetClient() {
               userMarkerRef.current = new google.maps.Marker({
                 position: userPos,
                 map: mapInst.current!,
-                icon: userBlueIcon(),
+                icon: userBluePinIcon(),
                 title: '目前位置',
                 zIndex: 9999,
               });
@@ -512,7 +515,14 @@ export default function WidgetClient() {
               <input value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="墾丁" className="border rounded-xl px-3 py-2" />
 
               <label className="text-sm font-medium">天數（Days）</label>
-              <input type="number" min={1} max={14} value={days} onChange={(e) => setDays(parseInt(e.target.value || '1', 10))} className="border rounded-xl px-3 py-2 w-28" />
+              <input
+                type="number"
+                min={1}
+                max={14}
+                value={days}
+                onChange={(e) => setDays(parseInt(e.target.value || '1', 10))}
+                className="border rounded-xl px-3 py-2 w-28"
+              />
 
               <div className="flex gap-2 flex-wrap">
                 <button

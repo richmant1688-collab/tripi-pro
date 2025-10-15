@@ -81,6 +81,19 @@ function useGoogleMaps(apiKey?: string) {
   return ready;
 }
 
+// ---------------- Helpers ----------------
+
+function userBlueIcon(): google.maps.Symbol {
+  return {
+    path: google.maps.SymbolPath.CIRCLE,
+    scale: 8,
+    fillColor: '#2563EB', // blue-600
+    fillOpacity: 1,
+    strokeColor: '#FFFFFF',
+    strokeWeight: 2,
+  };
+}
+
 // ---------------- Component ----------------
 
 export default function WidgetClient() {
@@ -90,8 +103,8 @@ export default function WidgetClient() {
   const routePolylineRef = useRef<google.maps.Polyline | null>(null); // 路線折線
   const routeMarkersRef = useRef<google.maps.Marker[]>([]); // S/E 兩點
   const poiMarkersRef = useRef<google.maps.Marker[]>([]); // 附近探索 POI（也包含初始行程POI）
-  const userMarkerRef = useRef<google.maps.Marker | null>(null); // 📍 使用者位置
-  const searchCircleRef = useRef<google.maps.Circle | null>(null); // 搜尋範圍圓
+  const userMarkerRef = useRef<google.maps.Marker | null>(null); // 📍 使用者位置（藍色)
+  const searchCircleRef = useRef<google.maps.Circle | null>(null); // 搜尋範圍圓（藍系）
   const mapIdleListenerRef = useRef<google.maps.MapsEventListener | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null); // 共用 InfoWindow（避免多個同時開）
@@ -146,8 +159,9 @@ export default function WidgetClient() {
           userMarkerRef.current = new google.maps.Marker({
             position: userPos,
             map: mapInst.current!,
-            label: '📍',
+            icon: userBlueIcon(),
             title: '目前位置',
+            zIndex: 9999,
           });
           if (showCircle) drawSearchCircle(mapInst.current!.getCenter()!);
         },
@@ -163,7 +177,7 @@ export default function WidgetClient() {
     attachIdleListener();
   }, [gmapsReady]);
 
-  // Apps bridge init/listeners（保留你原本邏輯）
+  // Apps bridge init/listeners
   useEffect(() => {
     const params = readInitParams();
     if (params.origin) setOrigin(params.origin);
@@ -173,7 +187,7 @@ export default function WidgetClient() {
       setTimeout(() => planTrip(), 10);
     }
 
-    listen((msg) => {
+    const off = listen((msg: any) => {
       if (msg.type === 'init' || msg.type === 'set') {
         if (msg.payload.origin) setOrigin(msg.payload.origin);
         if (msg.payload.destination) setDestination(msg.payload.destination);
@@ -185,6 +199,9 @@ export default function WidgetClient() {
     });
 
     send({ type: 'ready' });
+    return () => {
+      if (typeof off === 'function') off();
+    };
   }, []);
 
   const testCases = useMemo(
@@ -253,7 +270,9 @@ export default function WidgetClient() {
 
       // 顯示行程 POIs（取前 25）
       poiMarkersRef.current.forEach((m) => m.setMap(null));
-      poiMarkersRef.current = data.pois.slice(0, 25).map((p) => new g.Marker({ position: { lat: p.lat, lng: p.lng }, title: p.name, map: mapInst.current! }));
+      poiMarkersRef.current = data.pois
+        .slice(0, 25)
+        .map((p) => new g.Marker({ position: { lat: p.lat, lng: p.lng }, title: p.name, map: mapInst.current! }));
 
       setRouteInfo({ distance: data.distanceText, duration: data.durationText, start: data.start.address, end: data.end.address });
 
@@ -290,9 +309,11 @@ export default function WidgetClient() {
       center,
       radius,
       map: mapInst.current!,
-      fillOpacity: 0.08,
-      strokeOpacity: 0.6,
-      strokeWeight: 1.5,
+      fillOpacity: 0.1,
+      fillColor: '#93C5FD', // blue-300
+      strokeOpacity: 0.7,
+      strokeColor: '#2563EB', // blue-600
+      strokeWeight: 2,
     });
     searchCircleRef.current.setVisible(showCircle);
   }
@@ -324,7 +345,13 @@ export default function WidgetClient() {
           (pos) => {
             const userPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
             if (!userMarkerRef.current) {
-              userMarkerRef.current = new google.maps.Marker({ position: userPos, map: mapInst.current!, label: '📍', title: '目前位置' });
+              userMarkerRef.current = new google.maps.Marker({
+                position: userPos,
+                map: mapInst.current!,
+                icon: userBlueIcon(),
+                title: '目前位置',
+                zIndex: 9999,
+              });
             } else {
               userMarkerRef.current.setPosition(userPos);
             }
@@ -365,57 +392,61 @@ export default function WidgetClient() {
     return sharedInfoWindowRef.current;
   }
 
-  // 產生 InfoWindow HTML（含詳細資料）
-  function renderPlaceHtml(base: { name: string; vicinity?: string; rating?: number; user_ratings_total?: number }, details?: any) {
-    const lines: string[] = [];
-    lines.push(`<div style="max-width:260px">`);
-    lines.push(`<div style="font-weight:600;margin-bottom:4px">${escapeHtml(base.name)}</div>`);
-    if (base.vicinity) lines.push(`<div style="font-size:12px;color:#475569">${escapeHtml(base.vicinity)}</div>`);
+  // 產生 InfoWindow HTML（純單引號字串，避免反引號問題）
+  function renderPlaceHtml(
+    base: { name: string; vicinity?: string; rating?: number; user_ratings_total?: number },
+    details?: any
+  ) {
+    const parts: string[] = [];
+    parts.push('<div style="max-width:260px">');
+    parts.push('<div style="font-weight:600;margin-bottom:4px">' + escapeHtml(base.name) + '</div>');
+    if (base.vicinity) parts.push('<div style="font-size:12px;color:#475569">' + escapeHtml(base.vicinity) + '</div>');
     if (typeof base.rating === 'number') {
-      lines.push(`<div style="font-size:12px;margin-top:2px">評分：${base.rating}（${base.user_ratings_total || 0}）</div>`);
+      parts.push('<div style="font-size:12px;margin-top:2px">評分：' + base.rating + '（' + (base.user_ratings_total || 0) + '）</div>');
     }
     if (details) {
-      if (details.formatted_address) lines.push(`<div style="font-size:12px;margin-top:6px">地址：${escapeHtml(details.formatted_address)}</div>`);
-      if (details.formatted_phone_number) lines.push(`<div style="font-size:12px">電話：${escapeHtml(details.formatted_phone_number)}</div>`);
-      if (details.website) lines.push(`<div style="font-size:12px"><a href="${details.website}" target="_blank" rel="noopener noreferrer">官方網站</a></div>`);
+      if (details.formatted_address) parts.push('<div style="font-size:12px;margin-top:6px">地址：' + escapeHtml(details.formatted_address) + '</div>');
+      if (details.formatted_phone_number) parts.push('<div style="font-size:12px">電話：' + escapeHtml(details.formatted_phone_number) + '</div>');
+      if (details.website) parts.push('<div style="font-size:12px"><a href="' + details.website + '" target="_blank" rel="noopener noreferrer">官方網站</a></div>');
       if (details.opening_hours?.weekday_text) {
         const oh = (details.opening_hours.weekday_text as string[]).slice(0, 3).join('<br/>');
-        lines.push(`<div style="font-size:12px;margin-top:6px">營業時間：<br/>${oh}</div>`);
+        parts.push('<div style="font-size:12px;margin-top:6px">營業時間：<br/>' + oh + '</div>');
       }
     }
-    lines.push(`</div>`);
-    return lines.join('');
+    parts.push('</div>');
+    return parts.join('');
   }
 
   function escapeHtml(s: string) {
-    return s.replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#39;',
-    } as Record<string, string>)[c]!);
+    return s.replace(/[&<>\"']/g, (c) =>
+      ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      } as Record<string, string>)[c]!
+    );
   }
 
   async function openPlaceInfo(marker: google.maps.Marker, base: any) {
     const iw = getSharedInfoWindow();
-    iw.setContent(`<div style="padding:4px 2px">載入中…</div>`);
+    iw.setContent('<div style="padding:4px 2px">載入中…</div>');
     iw.open({ anchor: marker, map: mapInst.current! });
 
     try {
       if (!base.place_id) {
-        // 沒有 place_id（例如行程初始 POI）就用基礎資訊
         iw.setContent(renderPlaceHtml(base));
         return;
       }
-      const r = await fetch(`/api/places/details?place_id=${encodeURIComponent(base.place_id)}`);
+      const r = await fetch('/api/places/details?place_id=' + encodeURIComponent(base.place_id));
       const data = await r.json();
       if (data.error) {
         iw.setContent(renderPlaceHtml(base));
         return;
       }
       iw.setContent(renderPlaceHtml(base, data));
-    } catch (e) {
+    } catch {
       iw.setContent(renderPlaceHtml(base));
     }
   }
@@ -426,10 +457,10 @@ export default function WidgetClient() {
     try {
       const center = mapInst.current.getCenter()!;
       if (showCircle) drawSearchCircle(center);
-      const params = new URLSearchParams({ location: `${center.lat()},${center.lng()}`, radius: String(radius) });
+      const params = new URLSearchParams({ location: center.lat() + ',' + center.lng(), radius: String(radius) });
       types.forEach((t) => params.append('type', t));
       if (keyword) params.set('keyword', keyword);
-      const r = await fetch(`/api/places/nearby?${params.toString()}`);
+      const r = await fetch('/api/places/nearby?' + params.toString());
       const data = await r.json();
       if (data.error) throw new Error(data.error);
 
@@ -438,12 +469,17 @@ export default function WidgetClient() {
       poiMarkersRef.current = (data.items as any[])
         .map((it) => {
           if (!it.location) return null;
-          const mk = new google.maps.Marker({ position: it.location, map: mapInst.current!, title: `${it.name} (${it._type})` });
+          const mk = new google.maps.Marker({
+            position: it.location,
+            map: mapInst.current!,
+            title: it.name + ' (' + it._type + ')',
+          });
           mk.addListener('click', () => openPlaceInfo(mk, it));
           return mk;
         })
         .filter(Boolean) as google.maps.Marker[];
     } catch (e) {
+      // eslint-disable-next-line no-console
       console.warn(e);
     } finally {
       setNearbyLoading(false);
@@ -479,7 +515,10 @@ export default function WidgetClient() {
               <input type="number" min={1} max={14} value={days} onChange={(e) => setDays(parseInt(e.target.value || '1', 10))} className="border rounded-xl px-3 py-2 w-28" />
 
               <div className="flex gap-2 flex-wrap">
-                <button onClick={planTrip} className="mt-1 inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800">
+                <button
+                  onClick={planTrip}
+                  className="mt-1 inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800"
+                >
                   {loading ? '規劃中…' : '規劃行程'}
                 </button>
                 <button onClick={recenterToMe} className="inline-flex items-center justify-center rounded-xl px-3 py-2 border" title="定位到目前位置">
@@ -497,7 +536,9 @@ export default function WidgetClient() {
               <div className="text-sm leading-6">
                 <div>起點：{routeInfo.start}</div>
                 <div>終點：{routeInfo.end}</div>
-                <div>總距離：{routeInfo.distance} ・ 估計時間：{routeInfo.duration}</div>
+                <div>
+                  總距離：{routeInfo.distance} ・ 估計時間：{routeInfo.duration}
+                </div>
               </div>
             ) : (
               <div className="text-sm text-slate-500">請先輸入條件並按「規劃行程」。</div>
@@ -527,7 +568,14 @@ export default function WidgetClient() {
 
               <div>
                 <label className="text-xs text-slate-600">半徑（公尺）</label>
-                <input type="number" min={200} max={5000} value={radius} onChange={(e) => setRadius(parseInt(e.target.value || '500', 10))} className="border rounded-xl px-3 py-2 w-32 ml-2" />
+                <input
+                  type="number"
+                  min={200}
+                  max={5000}
+                  value={radius}
+                  onChange={(e) => setRadius(parseInt(e.target.value || '500', 10))}
+                  className="border rounded-xl px-3 py-2 w-32 ml-2"
+                />
               </div>
 
               <div className="flex items-center gap-4">
@@ -547,7 +595,10 @@ export default function WidgetClient() {
 
               <input value={keyword} onChange={(e) => setKeyword(e.target.value)} placeholder="ramen / coffee / museum ..." className="border rounded-xl px-3 py-2" />
 
-              <button onClick={searchNearby} className="inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800">
+              <button
+                onClick={searchNearby}
+                className="inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800"
+              >
                 {nearbyLoading ? '搜尋中…' : '搜尋附近'}
               </button>
             </div>
@@ -560,7 +611,9 @@ export default function WidgetClient() {
               <div className="space-y-4">
                 {plan.map((day) => (
                   <div key={day.day} className="border rounded-xl p-3">
-                    <div className="font-semibold">第 {day.day} 天 · {destination}</div>
+                    <div className="font-semibold">
+                      第 {day.day} 天 · {destination}
+                    </div>
                     <ol className="list-decimal ml-5 mt-1 space-y-1">
                       {day.pois.map((p, i) => (
                         <li key={i}>

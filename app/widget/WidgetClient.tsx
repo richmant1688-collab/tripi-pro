@@ -5,6 +5,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { readInitParams, listen, send } from '../../lib/apps-bridge';
 
+// ---------------- Types ----------------
+
 type POI = { name: string; lat: number; lng: number; address?: string; rating?: number };
 type DayPlan = { day: number; city: string; pois: POI[] };
 
@@ -18,6 +20,8 @@ type PlanResponse = {
   pois: POI[];
 };
 
+// ---------------- UI ----------------
+
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="w-full lg:w-96 bg-white/90 backdrop-blur rounded-2xl shadow-xl border border-gray-100 p-4 lg:p-5 space-y-3">
@@ -27,7 +31,8 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
   );
 }
 
-// 動態載入 Google Maps JS
+// ---------------- Google Maps Loader ----------------
+
 function useGoogleMaps(apiKey?: string) {
   const [ready, setReady] = useState(false);
 
@@ -44,7 +49,6 @@ function useGoogleMaps(apiKey?: string) {
 
       const src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places`;
       if (document.querySelector(`script[src^="https://maps.googleapis.com/maps/api/js"]`)) {
-        // 等現有 script 完成
         const trySet = () => {
           if ((window as any).google?.maps) setReady(true);
           else setTimeout(trySet, 200);
@@ -77,15 +81,27 @@ function useGoogleMaps(apiKey?: string) {
   return ready;
 }
 
+// ---------------- Component ----------------
+
 export default function WidgetClient() {
+  // Map refs
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInst = useRef<google.maps.Map | null>(null);
-  const routePolylineRef = useRef<google.maps.Polyline | null>(null);
-  const markersRef = useRef<google.maps.Marker[]>([]);
+  const routePolylineRef = useRef<google.maps.Polyline | null>(null); // 路線折線
+  const routeMarkersRef = useRef<google.maps.Marker[]>([]); // S/E 兩點
+  const poiMarkersRef = useRef<google.maps.Marker[]>([]); // 附近探索 POI（也包含初始行程POI）
+  const userMarkerRef = useRef<google.maps.Marker | null>(null); // 📍 使用者位置
+  const searchCircleRef = useRef<google.maps.Circle | null>(null); // 搜尋範圍圓
+  const mapIdleListenerRef = useRef<google.maps.MapsEventListener | null>(null);
+  const watchIdRef = useRef<number | null>(null);
+  const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null); // 共用 InfoWindow（避免多個同時開）
 
+  // Trip inputs
   const [origin, setOrigin] = useState('台北');
   const [destination, setDestination] = useState('墾丁');
   const [days, setDays] = useState(5);
+
+  // States
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>('');
   const [routeInfo, setRouteInfo] = useState<{
@@ -95,6 +111,15 @@ export default function WidgetClient() {
     end: string;
   } | null>(null);
   const [plan, setPlan] = useState<DayPlan[]>([]);
+
+  // Nearby controls
+  const [types, setTypes] = useState<string[]>(['tourist_attraction', 'restaurant']);
+  const [radius, setRadius] = useState(1500);
+  const [keyword, setKeyword] = useState('');
+  const [showCircle, setShowCircle] = useState(true);
+  const [autoUpdateOnDrag, setAutoUpdateOnDrag] = useState(true);
+  const [followMe, setFollowMe] = useState(false);
+  const [nearbyLoading, setNearbyLoading] = useState(false);
 
   const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
   const gmapsReady = useGoogleMaps(apiKey);
@@ -109,9 +134,36 @@ export default function WidgetClient() {
       fullscreenControl: false,
       streetViewControl: false,
     });
+
+    // 嘗試抓目前位置
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const userPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          mapInst.current!.setCenter(userPos);
+          mapInst.current!.setZoom(13);
+          if (userMarkerRef.current) userMarkerRef.current.setMap(null);
+          userMarkerRef.current = new google.maps.Marker({
+            position: userPos,
+            map: mapInst.current!,
+            label: '📍',
+            title: '目前位置',
+          });
+          if (showCircle) drawSearchCircle(mapInst.current!.getCenter()!);
+        },
+        () => {
+          if (showCircle) drawSearchCircle(mapInst.current!.getCenter()!);
+        },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+      );
+    } else {
+      if (showCircle) drawSearchCircle(mapInst.current.getCenter()!);
+    }
+
+    attachIdleListener();
   }, [gmapsReady]);
 
-  // 讀取 Apps SDK 初始參數 + 監聽
+  // Apps bridge init/listeners（保留你原本邏輯）
   useEffect(() => {
     const params = readInitParams();
     if (params.origin) setOrigin(params.origin);
@@ -150,7 +202,8 @@ export default function WidgetClient() {
     setDays(c.days);
   }
 
-  // 規劃行程
+  // ---------------- Trip planning ----------------
+
   async function planTrip() {
     if (!gmapsReady || !mapInst.current) return;
     setLoading(true);
@@ -169,13 +222,13 @@ export default function WidgetClient() {
 
       const g = google.maps;
 
-      // 清除舊圖層
+      // 清除舊路線（保留📍、圓、POI）
       if (routePolylineRef.current) {
         routePolylineRef.current.setMap(null);
         routePolylineRef.current = null;
       }
-      markersRef.current.forEach((m) => m.setMap(null));
-      markersRef.current = [];
+      routeMarkersRef.current.forEach((m) => m.setMap(null));
+      routeMarkersRef.current = [];
 
       // 畫路線
       const polyPath = data.polyline.map(([lat, lng]) => ({ lat, lng }));
@@ -185,46 +238,24 @@ export default function WidgetClient() {
         map: mapInst.current!,
       });
 
-      // 起終點
-      markersRef.current.push(
-        new g.Marker({
-          position: { lat: data.start.lat, lng: data.start.lng },
-          map: mapInst.current!,
-          label: 'S',
-          title: data.start.address,
-        })
+      // S/E
+      routeMarkersRef.current.push(
+        new g.Marker({ position: { lat: data.start.lat, lng: data.start.lng }, map: mapInst.current!, label: 'S', title: data.start.address })
       );
-      markersRef.current.push(
-        new g.Marker({
-          position: { lat: data.end.lat, lng: data.end.lng },
-          map: mapInst.current!,
-          label: 'E',
-          title: data.end.address,
-        })
+      routeMarkersRef.current.push(
+        new g.Marker({ position: { lat: data.end.lat, lng: data.end.lng }, map: mapInst.current!, label: 'E', title: data.end.address })
       );
 
-      // 調整視野
+      // fit bounds
       const bounds = new g.LatLngBounds();
       polyPath.forEach((p) => bounds.extend(p));
       mapInst.current!.fitBounds(bounds);
 
-      // 顯示 POIs（取前 25）
-      data.pois.slice(0, 25).forEach((p) => {
-        markersRef.current.push(
-          new g.Marker({
-            position: { lat: p.lat, lng: p.lng },
-            title: p.name,
-            map: mapInst.current!,
-          })
-        );
-      });
+      // 顯示行程 POIs（取前 25）
+      poiMarkersRef.current.forEach((m) => m.setMap(null));
+      poiMarkersRef.current = data.pois.slice(0, 25).map((p) => new g.Marker({ position: { lat: p.lat, lng: p.lng }, title: p.name, map: mapInst.current! }));
 
-      setRouteInfo({
-        distance: data.distanceText,
-        duration: data.durationText,
-        start: data.start.address,
-        end: data.end.address,
-      });
+      setRouteInfo({ distance: data.distanceText, duration: data.durationText, start: data.start.address, end: data.end.address });
 
       // 切天
       const perDay = Math.max(2, Math.min(3, Math.ceil((data.pois.length || 6) / days)));
@@ -244,77 +275,220 @@ export default function WidgetClient() {
     }
   }
 
-  const usingGoogle = gmapsReady;
+  // ---------------- Nearby & Circle helpers ----------------
 
-  // ----------- UI（務必保持在同一層函式內，確保 return 不會「跑到區塊外」）-----------
+  function drawSearchCircle(center: google.maps.LatLng) {
+    if (!mapInst.current) return;
+    if (searchCircleRef.current) {
+      searchCircleRef.current.setCenter(center);
+      searchCircleRef.current.setRadius(radius);
+      searchCircleRef.current.setVisible(showCircle);
+      searchCircleRef.current.setMap(showCircle ? mapInst.current : null);
+      return;
+    }
+    searchCircleRef.current = new google.maps.Circle({
+      center,
+      radius,
+      map: mapInst.current!,
+      fillOpacity: 0.08,
+      strokeOpacity: 0.6,
+      strokeWeight: 1.5,
+    });
+    searchCircleRef.current.setVisible(showCircle);
+  }
+
+  function attachIdleListener() {
+    mapIdleListenerRef.current?.remove();
+    if (!mapInst.current || !autoUpdateOnDrag) return;
+    mapIdleListenerRef.current = mapInst.current.addListener('idle', () => {
+      if (showCircle) drawSearchCircle(mapInst.current!.getCenter()!);
+    });
+  }
+
+  // radius/showCircle 更新時，立刻反映到地圖
+  useEffect(() => {
+    if (mapInst.current && searchCircleRef.current) {
+      searchCircleRef.current.setRadius(radius);
+      searchCircleRef.current.setVisible(showCircle);
+      searchCircleRef.current.setMap(showCircle ? mapInst.current : null);
+    }
+  }, [radius, showCircle]);
+
+  // watchPosition（追蹤位置）
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+
+    if (followMe) {
+      if (watchIdRef.current === null) {
+        watchIdRef.current = navigator.geolocation.watchPosition(
+          (pos) => {
+            const userPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+            if (!userMarkerRef.current) {
+              userMarkerRef.current = new google.maps.Marker({ position: userPos, map: mapInst.current!, label: '📍', title: '目前位置' });
+            } else {
+              userMarkerRef.current.setPosition(userPos);
+            }
+            if (mapInst.current) {
+              mapInst.current.setCenter(userPos);
+              if (showCircle) drawSearchCircle(mapInst.current.getCenter()!);
+            }
+          },
+          () => {},
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 }
+        );
+      }
+    } else if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+
+    return () => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+    };
+  }, [followMe, showCircle]);
+
+  function recenterToMe() {
+    if (!mapInst.current || !userMarkerRef.current) return;
+    const pos = userMarkerRef.current.getPosition();
+    if (!pos) return;
+    mapInst.current.setCenter(pos);
+    mapInst.current.setZoom(15);
+    if (showCircle) drawSearchCircle(pos);
+  }
+
+  // 共用 InfoWindow 取用（若未建立則建立一次）
+  function getSharedInfoWindow() {
+    if (!sharedInfoWindowRef.current) sharedInfoWindowRef.current = new google.maps.InfoWindow();
+    return sharedInfoWindowRef.current;
+  }
+
+  // 產生 InfoWindow HTML（含詳細資料）
+  function renderPlaceHtml(base: { name: string; vicinity?: string; rating?: number; user_ratings_total?: number }, details?: any) {
+    const lines: string[] = [];
+    lines.push(`<div style="max-width:260px">`);
+    lines.push(`<div style="font-weight:600;margin-bottom:4px">${escapeHtml(base.name)}</div>`);
+    if (base.vicinity) lines.push(`<div style="font-size:12px;color:#475569">${escapeHtml(base.vicinity)}</div>`);
+    if (typeof base.rating === 'number') {
+      lines.push(`<div style="font-size:12px;margin-top:2px">評分：${base.rating}（${base.user_ratings_total || 0}）</div>`);
+    }
+    if (details) {
+      if (details.formatted_address) lines.push(`<div style="font-size:12px;margin-top:6px">地址：${escapeHtml(details.formatted_address)}</div>`);
+      if (details.formatted_phone_number) lines.push(`<div style="font-size:12px">電話：${escapeHtml(details.formatted_phone_number)}</div>`);
+      if (details.website) lines.push(`<div style="font-size:12px"><a href="${details.website}" target="_blank" rel="noopener noreferrer">官方網站</a></div>`);
+      if (details.opening_hours?.weekday_text) {
+        const oh = (details.opening_hours.weekday_text as string[]).slice(0, 3).join('<br/>');
+        lines.push(`<div style="font-size:12px;margin-top:6px">營業時間：<br/>${oh}</div>`);
+      }
+    }
+    lines.push(`</div>`);
+    return lines.join('');
+  }
+
+  function escapeHtml(s: string) {
+    return s.replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    } as Record<string, string>)[c]!);
+  }
+
+  async function openPlaceInfo(marker: google.maps.Marker, base: any) {
+    const iw = getSharedInfoWindow();
+    iw.setContent(`<div style="padding:4px 2px">載入中…</div>`);
+    iw.open({ anchor: marker, map: mapInst.current! });
+
+    try {
+      if (!base.place_id) {
+        // 沒有 place_id（例如行程初始 POI）就用基礎資訊
+        iw.setContent(renderPlaceHtml(base));
+        return;
+      }
+      const r = await fetch(`/api/places/details?place_id=${encodeURIComponent(base.place_id)}`);
+      const data = await r.json();
+      if (data.error) {
+        iw.setContent(renderPlaceHtml(base));
+        return;
+      }
+      iw.setContent(renderPlaceHtml(base, data));
+    } catch (e) {
+      iw.setContent(renderPlaceHtml(base));
+    }
+  }
+
+  async function searchNearby() {
+    if (!mapInst.current) return;
+    setNearbyLoading(true);
+    try {
+      const center = mapInst.current.getCenter()!;
+      if (showCircle) drawSearchCircle(center);
+      const params = new URLSearchParams({ location: `${center.lat()},${center.lng()}`, radius: String(radius) });
+      types.forEach((t) => params.append('type', t));
+      if (keyword) params.set('keyword', keyword);
+      const r = await fetch(`/api/places/nearby?${params.toString()}`);
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+
+      // 清舊 POI（保留 S/E、📍與圓）
+      poiMarkersRef.current.forEach((m) => m.setMap(null));
+      poiMarkersRef.current = (data.items as any[])
+        .map((it) => {
+          if (!it.location) return null;
+          const mk = new google.maps.Marker({ position: it.location, map: mapInst.current!, title: `${it.name} (${it._type})` });
+          mk.addListener('click', () => openPlaceInfo(mk, it));
+          return mk;
+        })
+        .filter(Boolean) as google.maps.Marker[];
+    } catch (e) {
+      console.warn(e);
+    } finally {
+      setNearbyLoading(false);
+    }
+  }
+
+  // ---------------- UI ----------------
+
   return (
     <div className="min-h-screen w-full bg-white p-3 lg:p-6">
       <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-[1fr_420px] gap-6 items-start">
         <div className="relative w-full aspect-[16/10] rounded-xl shadow overflow-hidden border border-slate-200">
-          <div
-            ref={mapRef}
-            id="map"
-            style={{
-              width: '100%',
-              height: '60vh',
-              minHeight: 400,
-            }}
-          />
+          <div ref={mapRef} id="map" style={{ width: '100%', height: '60vh', minHeight: 400 }} />
         </div>
         <div className="space-y-6">
           <Panel title="旅行條件">
             <div className="grid grid-cols-1 gap-3">
               <div className="flex flex-wrap gap-2">
                 {testCases.map((c, i) => (
-                  <button
-                    key={i}
-                    onClick={() => applyCase(c)}
-                    className="text-xs rounded-lg border px-2 py-1 hover:bg-slate-50"
-                  >
+                  <button key={i} onClick={() => applyCase(c)} className="text-xs rounded-lg border px-2 py-1 hover:bg-slate-50">
                     {c.label}
                   </button>
                 ))}
               </div>
 
               <label className="text-sm font-medium">起點（Origin）</label>
-              <input
-                value={origin}
-                onChange={(e) => setOrigin(e.target.value)}
-                placeholder="台北"
-                className="border rounded-xl px-3 py-2"
-              />
+              <input value={origin} onChange={(e) => setOrigin(e.target.value)} placeholder="台北" className="border rounded-xl px-3 py-2" />
 
               <label className="text-sm font-medium">終點（Destination）</label>
-              <input
-                value={destination}
-                onChange={(e) => setDestination(e.target.value)}
-                placeholder="墾丁"
-                className="border rounded-xl px-3 py-2"
-              />
+              <input value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="墾丁" className="border rounded-xl px-3 py-2" />
 
               <label className="text-sm font-medium">天數（Days）</label>
-              <input
-                type="number"
-                min={1}
-                max={14}
-                value={days}
-                onChange={(e) => setDays(parseInt(e.target.value || '1', 10))}
-                className="border rounded-xl px-3 py-2 w-28"
-              />
+              <input type="number" min={1} max={14} value={days} onChange={(e) => setDays(parseInt(e.target.value || '1', 10))} className="border rounded-xl px-3 py-2 w-28" />
 
-              <button
-                onClick={planTrip}
-                className="mt-1 inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800"
-              >
-                {loading ? '規劃中…' : '規劃行程'}
-              </button>
+              <div className="flex gap-2 flex-wrap">
+                <button onClick={planTrip} className="mt-1 inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800">
+                  {loading ? '規劃中…' : '規劃行程'}
+                </button>
+                <button onClick={recenterToMe} className="inline-flex items-center justify-center rounded-xl px-3 py-2 border" title="定位到目前位置">
+                  定位到我
+                </button>
+              </div>
 
               {error && <div className="text-red-600 text-sm whitespace-pre-wrap">{error}</div>}
-              <div className="text-xs text-slate-500">
-                {usingGoogle
-                  ? 'Google Maps 模式（已讀到金鑰）。'
-                  : '尚未讀到 Google Maps，請確認 NEXT_PUBLIC_GOOGLE_MAPS_API_KEY。'}
-              </div>
+              <div className="text-xs text-slate-500">{gmapsReady ? 'Google Maps 模式（已讀到金鑰）。' : '尚未讀到 Google Maps，請確認 NEXT_PUBLIC_GOOGLE_MAPS_API_KEY。'}</div>
             </div>
           </Panel>
 
@@ -328,6 +502,55 @@ export default function WidgetClient() {
             ) : (
               <div className="text-sm text-slate-500">請先輸入條件並按「規劃行程」。</div>
             )}
+          </Panel>
+
+          <Panel title="附近探索（POI）">
+            <div className="grid gap-3 text-sm">
+              <div className="flex flex-wrap gap-2">
+                {[
+                  { k: 'tourist_attraction', t: '景點' },
+                  { k: 'lodging', t: '住宿' },
+                  { k: 'restaurant', t: '餐廳' },
+                  { k: 'cafe', t: '咖啡' },
+                  { k: 'gas_station', t: '加油站' },
+                ].map((opt) => (
+                  <label key={opt.k} className="inline-flex items-center gap-2 border rounded-full px-3 py-1">
+                    <input
+                      type="checkbox"
+                      checked={types.includes(opt.k)}
+                      onChange={(e) => setTypes((prev) => (e.target.checked ? [...prev, opt.k] : prev.filter((x) => x !== opt.k)))}
+                    />
+                    {opt.t}
+                  </label>
+                ))}
+              </div>
+
+              <div>
+                <label className="text-xs text-slate-600">半徑（公尺）</label>
+                <input type="number" min={200} max={5000} value={radius} onChange={(e) => setRadius(parseInt(e.target.value || '500', 10))} className="border rounded-xl px-3 py-2 w-32 ml-2" />
+              </div>
+
+              <div className="flex items-center gap-4">
+                <label className="inline-flex items-center gap-2">
+                  <input type="checkbox" checked={showCircle} onChange={(e) => setShowCircle(e.target.checked)} />
+                  顯示搜尋範圍圓
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input type="checkbox" checked={autoUpdateOnDrag} onChange={(e) => setAutoUpdateOnDrag(e.target.checked)} />
+                  拖曳地圖時更新圓
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input type="checkbox" checked={followMe} onChange={(e) => setFollowMe(e.target.checked)} />
+                  追蹤我的位置
+                </label>
+              </div>
+
+              <input value={keyword} onChange={(e) => setKeyword(e.target.value)} placeholder="ramen / coffee / museum ..." className="border rounded-xl px-3 py-2" />
+
+              <button onClick={searchNearby} className="inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800">
+                {nearbyLoading ? '搜尋中…' : '搜尋附近'}
+              </button>
+            </div>
           </Panel>
 
           <Panel title="每日行程">

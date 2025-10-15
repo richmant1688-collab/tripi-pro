@@ -3,12 +3,12 @@
   "info": {
     "title": "Tripi Pro API",
     "version": "1.0.0",
-    "description": "Plan multi-day travel itineraries between two cities. POST /api/plan returns polyline, start/end, distanceText, durationText, and POIs."
+    "description": "Tripi 旅遊助理 API：多日路線規劃與附近地點探索。伺服器端代理 Google Maps/Places，前端無需暴露金鑰。"
   },
   "servers": [
     {
-      "url": "https://tripi-pro.vercel.app/",
-      "description": "Production server for Tripi Pro"
+      "url": "https://tripi-pro.vercel.app",
+      "description": "Production"
     }
   ],
   "paths": {
@@ -16,6 +16,7 @@
       "post": {
         "summary": "Create a trip plan",
         "operationId": "createPlan",
+        "description": "輸入起點、終點與天數，回傳解碼後的 polyline 點列、起訖資訊、距離/時間與行程 POIs（最多 40 筆）。",
         "requestBody": {
           "required": true,
           "content": {
@@ -24,20 +25,9 @@
                 "type": "object",
                 "required": ["origin", "destination", "days"],
                 "properties": {
-                  "origin": {
-                    "type": "string",
-                    "example": "台北"
-                  },
-                  "destination": {
-                    "type": "string",
-                    "example": "墾丁"
-                  },
-                  "days": {
-                    "type": "integer",
-                    "example": 5,
-                    "minimum": 1,
-                    "maximum": 14
-                  }
+                  "origin": { "type": "string", "example": "台北" },
+                  "destination": { "type": "string", "example": "墾丁" },
+                  "days": { "type": "integer", "minimum": 1, "maximum": 14, "example": 5 }
                 }
               }
             }
@@ -45,19 +35,17 @@
         },
         "responses": {
           "200": {
-            "description": "Trip plan created successfully",
+            "description": "Trip plan created",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "provider": { "type": "string" },
+                    "provider": { "type": "string", "enum": ["google", "osrm"] },
                     "polyline": {
                       "type": "array",
-                      "items": {
-                        "type": "array",
-                        "items": { "type": "number" }
-                      }
+                      "items": { "type": "array", "items": { "type": "number" } },
+                      "description": "解碼後的路徑點序列。格式 [lat, lng][]"
                     },
                     "start": {
                       "type": "object",
@@ -75,8 +63,8 @@
                         "address": { "type": "string" }
                       }
                     },
-                    "distanceText": { "type": "string" },
-                    "durationText": { "type": "string" },
+                    "distanceText": { "type": "string", "example": "458 km" },
+                    "durationText": { "type": "string", "example": "5 小時 20 分" },
                     "pois": {
                       "type": "array",
                       "items": {
@@ -90,6 +78,136 @@
                         }
                       }
                     }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/api/places/nearby": {
+      "get": {
+        "summary": "Find nearby places",
+        "operationId": "findNearby",
+        "description": "以地圖中心與半徑搜尋多種類型的地點（可多選 type）。伺服器端代理 Google Places Nearby Search。",
+        "parameters": [
+          {
+            "name": "location",
+            "in": "query",
+            "required": true,
+            "description": "中心點經緯度（lat,lng）。例如：25.0478,121.5170",
+            "schema": { "type": "string", "example": "25.0478,121.5170" }
+          },
+          {
+            "name": "radius",
+            "in": "query",
+            "required": true,
+            "description": "搜尋半徑（公尺）。建議 500–5000",
+            "schema": { "type": "integer", "minimum": 100, "maximum": 50000, "example": 1500 }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": true,
+            "description": "地點類型。可重複多次。例如 restaurant、lodging、tourist_attraction、cafe、gas_station。",
+            "style": "form",
+            "explode": true,
+            "schema": { "type": "string", "example": "restaurant" }
+          },
+          {
+            "name": "keyword",
+            "in": "query",
+            "required": false,
+            "description": "關鍵字過濾（如 ramen、coffee、museum）",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Nearby results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer" },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": { "type": "string" },
+                          "vicinity": { "type": "string" },
+                          "place_id": { "type": "string" },
+                          "rating": { "type": "number" },
+                          "user_ratings_total": { "type": "integer" },
+                          "_type": { "type": "string", "description": "來源的類型（呼叫時的 type）" },
+                          "location": {
+                            "type": "object",
+                            "properties": {
+                              "lat": { "type": "number" },
+                              "lng": { "type": "number" }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/api/places/details": {
+      "get": {
+        "summary": "Get place details by place_id",
+        "operationId": "getPlaceDetails",
+        "description": "依 Google Places 的 place_id 取得詳細資訊（官網、電話、地址、營業時間、評分…）。",
+        "parameters": [
+          {
+            "name": "place_id",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Google Place ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Place details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string" },
+                    "website": { "type": "string" },
+                    "formatted_phone_number": { "type": "string" },
+                    "formatted_address": { "type": "string" },
+                    "rating": { "type": "number" },
+                    "user_ratings_total": { "type": "integer" },
+                    "opening_hours": {
+                      "type": "object",
+                      "properties": {
+                        "open_now": { "type": "boolean" },
+                        "weekday_text": { "type": "array", "items": { "type": "string" } }
+                      }
+                    },
+                    "geometry": {
+                      "type": "object",
+                      "properties": {
+                        "location": {
+                          "type": "object",
+                          "properties": { "lat": { "type": "number" }, "lng": { "type": "number" } }
+                        }
+                      }
+                    },
+                    "url": { "type": "string" }
                   }
                 }
               }

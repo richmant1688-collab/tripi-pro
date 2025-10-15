@@ -2,14 +2,14 @@
   "schema_version": "v1",
   "name_for_human": "旅行柴柴 Tripi Pro",
   "name_for_model": "tripi_pro_travel_planner",
-  "description_for_human": "輸入起點、終點與天數，一鍵產生旅遊行程，含距離時間與路線（支援 Google Maps）。",
-  "description_for_model": "Plan multi-day travel itineraries between two cities using the /api/plan endpoint. Return route polyline, start/end addresses and coordinates, distanceText, durationText, and up to 25 POIs. Inputs: origin (string), destination (string), days (1-14).",
+  "description_for_human": "輸入起點、終點與天數，一鍵產生旅遊行程，含距離時間與路線（支援 Google Maps），也能探索附近景點/餐廳/住宿。",
+  "description_for_model": "Plan multi-day itineraries via POST /api/plan (inputs: origin string, destination string, days 1–14). Response includes decoded polyline [lat,lng][], start/end addresses & coords, distanceText, durationText, and POIs. Also supports GET /api/places/nearby (location=lat,lng, radius=int meters, repeated type=restaurant|lodging|tourist_attraction|cafe|gas_station, optional keyword) and GET /api/places/details (place_id) to fetch website/phone/address/opening_hours. All requests are server-proxied; no client API keys required.",
   "auth": {
     "type": "none"
   },
   "api": {
     "type": "openapi",
-    "url": "https://tripi-pro.vercel.app/openapi.yaml"
+    "url": "https://tripi-pro.vercel.app/openapi.json"
   },
   "logo_url": "https://tripi-pro.vercel.app/logo.png",
   "contact_email": "andyteng1970@msn.com",

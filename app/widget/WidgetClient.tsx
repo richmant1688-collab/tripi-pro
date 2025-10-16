@@ -114,10 +114,13 @@ export default function WidgetClient() {
   const mapInst = useRef<google.maps.Map | null>(null);
   const routePolylineRef = useRef<google.maps.Polyline | null>(null); // 路線折線
   const routeMarkersRef = useRef<google.maps.Marker[]>([]); // S/E 兩點
-  const poiMarkersRef = useRef<google.maps.Marker[]>([]); // 附近探索 POI（也包含初始行程POI）
+  const poiMarkersRef = useRef<google.maps.Marker[]>([]); // 行程 POI（跟 Nearby 分離）
+  const nearbyMarkersRef = useRef<google.maps.Marker[]>([]); // 附近探索（紅色）標記
   const userMarkerRef = useRef<google.maps.Marker | null>(null); // 目前位置（藍色針）
+  const customCenterMarkerRef = useRef<google.maps.Marker | null>(null); // 自訂搜尋中心
   const searchCircleRef = useRef<google.maps.Circle | null>(null); // 搜尋範圍圓（藍系）
   const mapIdleListenerRef = useRef<google.maps.MapsEventListener | null>(null);
+  const mapClickListenerRef = useRef<google.maps.MapsEventListener | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null); // 共用 InfoWindow
 
@@ -125,8 +128,6 @@ export default function WidgetClient() {
   const [centerInput, setCenterInput] = useState(''); // 可輸入座標或景點/地址
   const centerInputRef = useRef<HTMLInputElement | null>(null);
   const [pickOnMap, setPickOnMap] = useState(false);
-  const customCenterMarkerRef = useRef<google.maps.Marker | null>(null);
-  const mapClickListenerRef = useRef<google.maps.MapsEventListener | null>(null);
 
   // Trip inputs
   const [origin, setOrigin] = useState('台北');
@@ -278,7 +279,7 @@ export default function WidgetClient() {
 
       const g = google.maps;
 
-      // 清除舊路線（保留📍、圓、POI、自訂中心）
+      // 清除舊路線（保留📍、圓、行程POI、自訂中心與 Nearby 標記）
       if (routePolylineRef.current) {
         routePolylineRef.current.setMap(null);
         routePolylineRef.current = null;
@@ -307,7 +308,7 @@ export default function WidgetClient() {
       polyPath.forEach((p) => bounds.extend(p));
       mapInst.current!.fitBounds(bounds);
 
-      // 顯示行程 POIs（取前 25）
+      // 顯示行程 POIs（取前 25）——獨立於 Nearby
       poiMarkersRef.current.forEach((m) => m.setMap(null));
       poiMarkersRef.current = data.pois
         .slice(0, 25)
@@ -433,7 +434,7 @@ export default function WidgetClient() {
     return sharedInfoWindowRef.current;
   }
 
-  // 產生 InfoWindow HTML（純單引號字串，避免反引號問題）
+  // 產生 InfoWindow HTML（純單引號字串，避免反引號問題），營業時間使用小區塊可捲動
   function renderPlaceHtml(
     base: { name: string; vicinity?: string; rating?: number; user_ratings_total?: number },
     details?: any
@@ -450,8 +451,14 @@ export default function WidgetClient() {
       if (details.formatted_phone_number) parts.push('<div style="font-size:12px">電話：' + escapeHtml(details.formatted_phone_number) + '</div>');
       if (details.website) parts.push('<div style="font-size:12px"><a href="' + details.website + '" target="_blank" rel="noopener noreferrer">官方網站</a></div>');
       if (details.opening_hours?.weekday_text) {
-        const ohAll = (details.opening_hours.weekday_text as string[]).join('<br/>'); // 顯示全週
-        parts.push('<div style="font-size:12px;margin-top:6px">營業時間：<br/>' + ohAll + '</div>');
+        const ohAll = (details.opening_hours.weekday_text as string[]).join('<br/>');
+        parts.push('<div style="font-size:12px;margin-top:6px">營業時間：</div>');
+        parts.push(
+          '<div style="font-size:12px;line-height:1.35;max-height:60px;overflow:auto;' +
+            'margin-top:2px;padding:6px 8px;border:1px solid #e5e7eb;border-radius:6px;background:#f8fafc;">' +
+            ohAll +
+          '</div>'
+        );
       }
     }
     parts.push('</div>');
@@ -518,7 +525,6 @@ export default function WidgetClient() {
 
   function setCustomCenter(pos: google.maps.LatLngLiteral) {
     if (!mapInst.current) return;
-    // 放或更新自訂中心圖釘（與使用者位置不同）
     if (!customCenterMarkerRef.current) {
       customCenterMarkerRef.current = new google.maps.Marker({
         position: pos,
@@ -576,9 +582,9 @@ export default function WidgetClient() {
       const data = await r.json();
       if (data.error) throw new Error(data.error);
 
-      // 清舊 POI（保留 S/E、📍、自訂中心與圓）
-      poiMarkersRef.current.forEach((m) => m.setMap(null));
-      poiMarkersRef.current = (data.items as any[])
+      // 清除舊的「附近探索」標記（保留 S/E、行程POI、📍、自訂中心與圓）
+      nearbyMarkersRef.current.forEach((m) => m.setMap(null));
+      nearbyMarkersRef.current = (data.items as any[])
         .map((it) => {
           if (!it.location) return null;
           const mk = new google.maps.Marker({
@@ -596,6 +602,12 @@ export default function WidgetClient() {
     } finally {
       setNearbyLoading(false);
     }
+  }
+
+  function clearNearbyResults() {
+    nearbyMarkersRef.current.forEach((m) => m.setMap(null));
+    nearbyMarkersRef.current = [];
+    try { sharedInfoWindowRef.current?.close(); } catch {}
   }
 
   // ---------------- UI ----------------
@@ -773,12 +785,21 @@ export default function WidgetClient() {
 
               <input value={keyword} onChange={(e) => setKeyword(e.target.value)} placeholder="ramen / coffee / museum ..." className="border rounded-xl px-3 py-2" />
 
-              <button
-                onClick={searchNearby}
-                className="inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800"
-              >
-                {nearbyLoading ? '搜尋中…' : '搜尋附近'}
-              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={searchNearby}
+                  className="inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800"
+                >
+                  {nearbyLoading ? '搜尋中…' : '搜尋附近'}
+                </button>
+                <button
+                  onClick={clearNearbyResults}
+                  className="inline-flex items-center justify-center rounded-xl px-4 py-2 border hover:bg-slate-50"
+                  title="清除附近探索的紅色標記"
+                >
+                  清除搜尋結果
+                </button>
+              </div>
             </div>
           </Panel>
 

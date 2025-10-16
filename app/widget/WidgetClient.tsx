@@ -97,6 +97,15 @@ function userBluePinIcon(): google.maps.Icon {
   };
 }
 
+// 嘗試解析 "lat,lng"
+function parseLatLng(text: string): google.maps.LatLngLiteral | null {
+  const m = text.trim().match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (!m) return null;
+  const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
+  if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  return { lat, lng };
+}
+
 // ---------------- Component ----------------
 
 export default function WidgetClient() {
@@ -111,6 +120,13 @@ export default function WidgetClient() {
   const mapIdleListenerRef = useRef<google.maps.MapsEventListener | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null); // 共用 InfoWindow
+
+  // 自訂搜尋中心
+  const [centerInput, setCenterInput] = useState(''); // 可輸入座標或景點/地址
+  const centerInputRef = useRef<HTMLInputElement | null>(null);
+  const [pickOnMap, setPickOnMap] = useState(false);
+  const customCenterMarkerRef = useRef<google.maps.Marker | null>(null);
+  const mapClickListenerRef = useRef<google.maps.MapsEventListener | null>(null);
 
   // Trip inputs
   const [origin, setOrigin] = useState('台北');
@@ -130,8 +146,8 @@ export default function WidgetClient() {
 
   // Nearby controls
   const [types, setTypes] = useState<string[]>(['tourist_attraction', 'restaurant']);
-  const [radius, setRadius] = useState(1500);          // 實際使用的半徑（number）
-  const [radiusInput, setRadiusInput] = useState('1500'); // 顯示用字串（可清空）
+  const [radius, setRadius] = useState(1500);             // 實際半徑（number）
+  const [radiusInput, setRadiusInput] = useState('1500'); // 顯示用字串（允許清空）
   const [keyword, setKeyword] = useState('');
   const [showCircle, setShowCircle] = useState(true);
   const [autoUpdateOnDrag, setAutoUpdateOnDrag] = useState(true);
@@ -179,6 +195,25 @@ export default function WidgetClient() {
     }
 
     attachIdleListener();
+  }, [gmapsReady]);
+
+  // 初始化 Places Autocomplete（自訂中心輸入框）
+  useEffect(() => {
+    if (!gmapsReady || !centerInputRef.current) return;
+    const ac = new google.maps.places.Autocomplete(centerInputRef.current, {
+      fields: ['geometry', 'name', 'formatted_address'],
+      types: ['geocode', 'establishment'],
+    });
+    const listener = ac.addListener('place_changed', () => {
+      const place = ac.getPlace();
+      const loc = place?.geometry?.location;
+      if (loc) {
+        const p = { lat: loc.lat(), lng: loc.lng() };
+        setCenterInput(place.formatted_address || place.name || (p.lat + ',' + p.lng));
+        setCustomCenter(p);
+      }
+    });
+    return () => listener.remove();
   }, [gmapsReady]);
 
   // Apps bridge init/listeners
@@ -243,7 +278,7 @@ export default function WidgetClient() {
 
       const g = google.maps;
 
-      // 清除舊路線（保留📍、圓、POI）
+      // 清除舊路線（保留📍、圓、POI、自訂中心）
       if (routePolylineRef.current) {
         routePolylineRef.current.setMap(null);
         routePolylineRef.current = null;
@@ -326,7 +361,9 @@ export default function WidgetClient() {
     mapIdleListenerRef.current?.remove();
     if (!mapInst.current || !autoUpdateOnDrag) return;
     mapIdleListenerRef.current = mapInst.current.addListener('idle', () => {
-      if (showCircle) drawSearchCircle(mapInst.current!.getCenter()!);
+      if (!showCircle) return;
+      const fixed = customCenterMarkerRef.current?.getPosition();
+      drawSearchCircle(fixed ?? mapInst.current!.getCenter()!);
     });
   }
 
@@ -412,17 +449,10 @@ export default function WidgetClient() {
       if (details.formatted_address) parts.push('<div style="font-size:12px;margin-top:6px">地址：' + escapeHtml(details.formatted_address) + '</div>');
       if (details.formatted_phone_number) parts.push('<div style="font-size:12px">電話：' + escapeHtml(details.formatted_phone_number) + '</div>');
       if (details.website) parts.push('<div style="font-size:12px"><a href="' + details.website + '" target="_blank" rel="noopener noreferrer">官方網站</a></div>');
-        if (details.opening_hours?.weekday_text) {
-          const ohAll = (details.opening_hours.weekday_text as string[]).join('<br/>');
-          parts.push('<div style="font-size:12px;margin-top:6px">營業時間：</div>');
-          // 只顯示約 3 行，其餘可用捲軸查看
-          parts.push(
-            '<div style="font-size:12px;line-height:1.35;max-height:60px;overflow:auto;' +
-              'margin-top:2px;padding:6px 8px;border:1px solid #e5e7eb;border-radius:6px;background:#f8fafc;">' +
-              ohAll +
-            '</div>'
-          );
-        }
+      if (details.opening_hours?.weekday_text) {
+        const ohAll = (details.opening_hours.weekday_text as string[]).join('<br/>'); // 顯示全週
+        parts.push('<div style="font-size:12px;margin-top:6px">營業時間：<br/>' + ohAll + '</div>');
+      }
     }
     parts.push('</div>');
     return parts.join('');
@@ -462,11 +492,82 @@ export default function WidgetClient() {
     }
   }
 
+  // ---------- Custom Search Center (coords/address/POI + pick on map) ----------
+
+  async function geocodeAddress(query: string): Promise<google.maps.LatLngLiteral | null> {
+    if (!query) return null;
+    const geocoder = new google.maps.Geocoder();
+
+    // 用目前地圖中心做偏好範圍（非限制，僅排序偏好）
+    let bounds: google.maps.LatLngBounds | undefined;
+    if (mapInst.current) {
+      const c = mapInst.current.getCenter()!;
+      const d = 0.3; // 約 30~40km 的方框
+      bounds = new google.maps.LatLngBounds(
+        new google.maps.LatLng(c.lat() - d, c.lng() - d),
+        new google.maps.LatLng(c.lat() + d, c.lng() + d)
+      );
+    }
+
+    const res = await geocoder.geocode({ address: query, bounds /*, region: 'tw'*/ });
+    const r = res.results?.[0];
+    if (!r) return null;
+    const loc = r.geometry.location;
+    return { lat: loc.lat(), lng: loc.lng() };
+  }
+
+  function setCustomCenter(pos: google.maps.LatLngLiteral) {
+    if (!mapInst.current) return;
+    // 放或更新自訂中心圖釘（與使用者位置不同）
+    if (!customCenterMarkerRef.current) {
+      customCenterMarkerRef.current = new google.maps.Marker({
+        position: pos,
+        map: mapInst.current!,
+        title: '自訂搜尋中心',
+        icon: {
+          url: 'https://maps.gstatic.com/mapfiles/ms2/micons/blue-dot.png',
+          scaledSize: new google.maps.Size(32, 32),
+          anchor: new google.maps.Point(16, 16),
+        },
+        zIndex: 9998,
+      });
+    } else {
+      customCenterMarkerRef.current.setPosition(pos);
+      customCenterMarkerRef.current.setMap(mapInst.current!);
+    }
+    mapInst.current.setCenter(pos);
+    mapInst.current.setZoom(Math.max(mapInst.current.getZoom() || 13, 13));
+    drawSearchCircle(new google.maps.LatLng(pos));
+  }
+
+  function clearCustomCenter() {
+    if (customCenterMarkerRef.current) {
+      customCenterMarkerRef.current.setMap(null);
+    }
+  }
+
+  function enablePickOnMap(enable: boolean) {
+    setPickOnMap(enable);
+    mapClickListenerRef.current?.remove();
+    mapClickListenerRef.current = null;
+    if (enable && mapInst.current) {
+      mapClickListenerRef.current = mapInst.current.addListener('click', (e: google.maps.MapMouseEvent) => {
+        const ll = e.latLng!;
+        setCenterInput(ll.lat().toFixed(6) + ',' + ll.lng().toFixed(6));
+        setCustomCenter({ lat: ll.lat(), lng: ll.lng() });
+      });
+    }
+  }
+
+  // ---------------- Nearby search ----------------
+
   async function searchNearby() {
     if (!mapInst.current) return;
     setNearbyLoading(true);
     try {
-      const center = mapInst.current.getCenter()!;
+      const center =
+        customCenterMarkerRef.current?.getPosition() ??
+        mapInst.current.getCenter()!;
       if (showCircle) drawSearchCircle(center);
       const params = new URLSearchParams({ location: center.lat() + ',' + center.lng(), radius: String(radius) });
       types.forEach((t) => params.append('type', t));
@@ -475,7 +576,7 @@ export default function WidgetClient() {
       const data = await r.json();
       if (data.error) throw new Error(data.error);
 
-      // 清舊 POI（保留 S/E、📍與圓）
+      // 清舊 POI（保留 S/E、📍、自訂中心與圓）
       poiMarkersRef.current.forEach((m) => m.setMap(null));
       poiMarkersRef.current = (data.items as any[])
         .map((it) => {
@@ -606,6 +707,53 @@ export default function WidgetClient() {
                   }}
                   className="border rounded-xl px-3 py-2 w-32 ml-2"
                 />
+              </div>
+
+              {/* 自訂搜尋中心 */}
+              <div className="space-y-2">
+                <label className="text-xs text-slate-600">自訂搜尋中心（輸入座標「lat,lng」或景點/地址）</label>
+                <div className="flex gap-2">
+                  <input
+                    ref={centerInputRef}
+                    value={centerInput}
+                    onChange={(e) => setCenterInput(e.target.value)}
+                    placeholder="例：25.033964,121.564468 或 台北101 / 台北車站"
+                    className="border rounded-xl px-3 py-2 flex-1"
+                  />
+                  <button
+                    type="button"
+                    className="border rounded-xl px-3 py-2"
+                    onClick={async () => {
+                      if (!mapInst.current) return;
+                      const ll = parseLatLng(centerInput) || await geocodeAddress(centerInput);
+                      if (!ll) {
+                        alert('無法解析位置，請輸入「lat,lng」或有效的景點/地址');
+                        return;
+                      }
+                      setCustomCenter(ll);
+                    }}
+                  >
+                    設為中心
+                  </button>
+                  <button
+                    type="button"
+                    className={`rounded-xl px-3 py-2 ${pickOnMap ? 'bg-slate-900 text-white' : 'border'}`}
+                    onClick={() => enablePickOnMap(!pickOnMap)}
+                    title="在地圖上點一下設定搜尋中心"
+                  >
+                    {pickOnMap ? '點選中…' : '用地圖選點'}
+                  </button>
+                  <button type="button" className="border rounded-xl px-3 py-2" onClick={() => { clearCustomCenter(); }}>
+                    清除中心
+                  </button>
+                </div>
+                <div className="text-xs text-slate-500">
+                  目前中心：{
+                    customCenterMarkerRef.current?.getPosition()
+                      ? `${customCenterMarkerRef.current.getPosition()!.lat().toFixed(6)}, ${customCenterMarkerRef.current.getPosition()!.lng().toFixed(6)}`
+                      : '使用地圖中心'
+                  }
+                </div>
               </div>
 
               <div className="flex items-center gap-4">

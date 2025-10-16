@@ -412,10 +412,17 @@ export default function WidgetClient() {
       if (details.formatted_address) parts.push('<div style="font-size:12px;margin-top:6px">地址：' + escapeHtml(details.formatted_address) + '</div>');
       if (details.formatted_phone_number) parts.push('<div style="font-size:12px">電話：' + escapeHtml(details.formatted_phone_number) + '</div>');
       if (details.website) parts.push('<div style="font-size:12px"><a href="' + details.website + '" target="_blank" rel="noopener noreferrer">官方網站</a></div>');
-    if (details.opening_hours?.weekday_text) {
-      const ohAll = (details.opening_hours.weekday_text as string[]).join('<br/>'); // 顯示全部 7 天
-      parts.push('<div style="font-size:12px;margin-top:6px">營業時間：<br/>' + ohAll + '</div>');
-    }
+        if (details.opening_hours?.weekday_text) {
+          const ohAll = (details.opening_hours.weekday_text as string[]).join('<br/>');
+          parts.push('<div style="font-size:12px;margin-top:6px">營業時間：</div>');
+          // 只顯示約 3 行，其餘可用捲軸查看
+          parts.push(
+            '<div style="font-size:12px;line-height:1.35;max-height:60px;overflow:auto;' +
+              'margin-top:2px;padding:6px 8px;border:1px solid #e5e7eb;border-radius:6px;background:#f8fafc;">' +
+              ohAll +
+            '</div>'
+          );
+        }
     }
     parts.push('</div>');
     return parts.join('');

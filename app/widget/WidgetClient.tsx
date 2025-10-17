@@ -279,7 +279,7 @@ export default function WidgetClient() {
 
       const g = google.maps;
 
-      // 清除舊路線（保留📍、圓、行程POI、自訂中心與 Nearby 標記）
+      // 清除舊路線（保留?、圓、行程POI、自訂中心與 Nearby 標記）
       if (routePolylineRef.current) {
         routePolylineRef.current.setMap(null);
         routePolylineRef.current = null;
@@ -419,6 +419,12 @@ export default function WidgetClient() {
     };
   }, [followMe, showCircle]);
 
+  // 判斷自訂中心是否啟用（marker 存在且在地圖上）
+  function isCustomCenterActive() {
+    const mk = customCenterMarkerRef.current;
+    return !!(mk && mk.getMap());
+  }
+
   function recenterToMe() {
     if (!mapInst.current || !userMarkerRef.current) return;
     const pos = userMarkerRef.current.getPosition();
@@ -426,6 +432,8 @@ export default function WidgetClient() {
     mapInst.current.setCenter(pos);
     mapInst.current.setZoom(15);
     if (showCircle) drawSearchCircle(pos);
+    // 讓後續搜尋用目前地圖中心（關閉自訂中心）
+    clearCustomCenter();
   }
 
   // 共用 InfoWindow 取用（若未建立則建立一次）
@@ -571,9 +579,10 @@ export default function WidgetClient() {
     if (!mapInst.current) return;
     setNearbyLoading(true);
     try {
-      const center =
-        customCenterMarkerRef.current?.getPosition() ??
-        mapInst.current.getCenter()!;
+      // ✅ 只有自訂中心啟用時才使用，否則用地圖中心
+      const center = isCustomCenterActive()
+        ? customCenterMarkerRef.current!.getPosition()!
+        : mapInst.current!.getCenter()!;
       if (showCircle) drawSearchCircle(center);
       const params = new URLSearchParams({ location: center.lat() + ',' + center.lng(), radius: String(radius) });
       types.forEach((t) => params.append('type', t));
@@ -582,7 +591,7 @@ export default function WidgetClient() {
       const data = await r.json();
       if (data.error) throw new Error(data.error);
 
-      // 清除舊的「附近探索」標記（保留 S/E、行程POI、📍、自訂中心與圓）
+      // 清除舊的「附近探索」標記（保留 S/E、行程POI、?、自訂中心與圓）
       nearbyMarkersRef.current.forEach((m) => m.setMap(null));
       nearbyMarkersRef.current = (data.items as any[])
         .map((it) => {

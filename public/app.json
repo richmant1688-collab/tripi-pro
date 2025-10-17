@@ -1,7 +1,7 @@
 ﻿{
   "schema_version": "v1",
   "name_for_human": "旅行柴柴 Tripi Pro",
-  "name_for_model": "tripi_pro_travel_planner",
+  "name_for_model": "tripi_pro",
   "description_for_human": "輸入起點、終點與天數，一鍵產生旅遊行程，含距離時間與路線（支援 Google Maps），也能探索附近景點/餐廳/住宿。",
   "description_for_model": "Plan multi-day itineraries via POST /api/plan (inputs: origin string, destination string, days 1–14). Response includes decoded polyline [lat,lng][], start/end addresses & coords, distanceText, durationText, and POIs. Also supports GET /api/places/nearby (location=lat,lng, radius=int meters, repeated type=restaurant|lodging|tourist_attraction|cafe|gas_station, optional keyword) and GET /api/places/details (place_id) to fetch website/phone/address/opening_hours. All requests are server-proxied; no client API keys required.",
   "auth": {

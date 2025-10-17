@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Tripi Pro API",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Tripi 旅遊助理 API：多日路線規劃與附近地點探索。伺服器端代理 Google Maps/Places，前端無需暴露金鑰。"
   },
   "servers": [
@@ -82,6 +82,14 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+          },
+          "500": {
+            "description": "Server error",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
           }
         }
       }
@@ -91,7 +99,7 @@
       "get": {
         "summary": "Find nearby places",
         "operationId": "findNearby",
-        "description": "以地圖中心與半徑搜尋多種類型的地點（可多選 type）。伺服器端代理 Google Places Nearby Search。",
+        "description": "以中心點與半徑搜尋多種類型地點。可多選 type（重複傳遞）。建議半徑 200–5000 公尺。",
         "parameters": [
           {
             "name": "location",
@@ -104,24 +112,31 @@
             "name": "radius",
             "in": "query",
             "required": true,
-            "description": "搜尋半徑（公尺）。建議 500–5000",
-            "schema": { "type": "integer", "minimum": 100, "maximum": 50000, "example": 1500 }
+            "description": "搜尋半徑（公尺）。建議 200–5000",
+            "schema": { "type": "integer", "minimum": 200, "maximum": 5000, "example": 1500 }
           },
           {
             "name": "type",
             "in": "query",
             "required": true,
-            "description": "地點類型。可重複多次。例如 restaurant、lodging、tourist_attraction、cafe、gas_station。",
+            "description": "地點類型，可重複多次（例如 &type=restaurant&type=cafe）。支援：restaurant、lodging、tourist_attraction、cafe、gas_station。",
             "style": "form",
             "explode": true,
-            "schema": { "type": "string", "example": "restaurant" }
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["restaurant", "lodging", "tourist_attraction", "cafe", "gas_station"]
+              },
+              "example": ["restaurant", "cafe"]
+            }
           },
           {
             "name": "keyword",
             "in": "query",
             "required": false,
             "description": "關鍵字過濾（如 ramen、coffee、museum）",
-            "schema": { "type": "string" }
+            "schema": { "type": "string", "example": "ramen" }
           }
         ],
         "responses": {
@@ -143,7 +158,7 @@
                           "place_id": { "type": "string" },
                           "rating": { "type": "number" },
                           "user_ratings_total": { "type": "integer" },
-                          "_type": { "type": "string", "description": "來源的類型（呼叫時的 type）" },
+                          "_type": { "type": "string", "description": "來源的類型（呼叫時的 type 值）" },
                           "location": {
                             "type": "object",
                             "properties": {
@@ -158,6 +173,14 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+          },
+          "500": {
+            "description": "Server error",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
           }
         }
       }
@@ -208,10 +231,19 @@
                       }
                     },
                     "url": { "type": "string" }
+                  },
+                  "additionalProperties": true
                   }
                 }
               }
-            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+          },
+          "500": {
+            "description": "Server error",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
           }
         }
       }

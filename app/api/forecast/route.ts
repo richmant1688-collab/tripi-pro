@@ -1,6 +1,6 @@
 // app/api/forecast/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { outfitAdvice } from '@/app/lib/weather-advice';
+import { outfitAdvice } from '../../lib/weather-advice';
 
 const API = 'https://api.openweathermap.org/data/2.5/forecast';
 const UNITS = new Set(['standard', 'metric', 'imperial']);

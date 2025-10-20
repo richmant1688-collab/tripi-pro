@@ -7,7 +7,14 @@ import { readInitParams, listen, send } from '../../lib/apps-bridge';
 
 // ---------------- Types ----------------
 
-type POI = { name: string; lat: number; lng: number; address?: string; rating?: number };
+type POI = {
+  name: string;
+  lat: number;
+  lng: number;
+  address?: string;
+  rating?: number;
+  _type?: 'tourist_attraction' | 'restaurant' | 'lodging';
+};
 type DayPlan = { day: number; city: string; pois: POI[] };
 
 type PlanResponse = {
@@ -106,6 +113,36 @@ function parseLatLng(text: string): google.maps.LatLngLiteral | null {
   return { lat, lng };
 }
 
+// 直線距離（哈弗辛公式）+ 顯示格式
+function haversineKm(a: { lat: number; lng: number }, b: { lat: number; lng: number }) {
+  const R = 6371;
+  const dLat = (b.lat - a.lat) * Math.PI / 180;
+  const dLng = (b.lng - a.lng) * Math.PI / 180;
+  const lat1 = a.lat * Math.PI / 180;
+  const lat2 = b.lat * Math.PI / 180;
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLng = Math.sin(dLng / 2);
+  const c = 2 * Math.asin(Math.sqrt(sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLng * sinDLng));
+  return R * c;
+}
+function fmtDistance(km: number) {
+  return km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
+}
+
+// 小徽章：型別 → 標籤 & 樣式
+function typeLabel(t?: string) {
+  if (t === 'restaurant') return '餐廳';
+  if (t === 'lodging') return '住宿';
+  if (t === 'tourist_attraction') return '景點';
+  return null;
+}
+function typeBadgeClass(t?: string) {
+  if (t === 'restaurant') return 'bg-rose-50 text-rose-700 border-rose-200';
+  if (t === 'lodging') return 'bg-indigo-50 text-indigo-700 border-indigo-200';
+  if (t === 'tourist_attraction') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+  return 'bg-slate-50 text-slate-700 border-slate-200';
+}
+
 // ---------------- Component ----------------
 
 export default function WidgetClient() {
@@ -123,6 +160,7 @@ export default function WidgetClient() {
   const mapClickListenerRef = useRef<google.maps.MapsEventListener | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null); // 共用 InfoWindow
+  const routeStartRef = useRef<{ lat: number; lng: number } | null>(null); // 記住整體起點
 
   // 自訂搜尋中心
   const [centerInput, setCenterInput] = useState(''); // 可輸入座標或景點/地址
@@ -315,6 +353,9 @@ export default function WidgetClient() {
         .map((p) => new g.Marker({ position: { lat: p.lat, lng: p.lng }, title: p.name, map: mapInst.current! }));
 
       setRouteInfo({ distance: data.distanceText, duration: data.durationText, start: data.start.address, end: data.end.address });
+
+      // 記住整體起點座標（供距離計算）
+      routeStartRef.current = { lat: data.start.lat, lng: data.start.lng };
 
       // 切天
       const perDay = Math.max(2, Math.min(3, Math.ceil((data.pois.length || 6) / days)));
@@ -579,7 +620,7 @@ export default function WidgetClient() {
     if (!mapInst.current) return;
     setNearbyLoading(true);
     try {
-      // ✅ 只有自訂中心啟用時才使用，否則用地圖中心
+      // 只有自訂中心啟用時才使用，否則用地圖中心
       const center = isCustomCenterActive()
         ? customCenterMarkerRef.current!.getPosition()!
         : mapInst.current!.getCenter()!;
@@ -817,21 +858,65 @@ export default function WidgetClient() {
               <div className="text-sm text-slate-500">尚無行程。</div>
             ) : (
               <div className="space-y-4">
-                {plan.map((day) => (
+                {plan.map((day, dayIdx) => {
+                  // 本日第一個距離起算點：第一天用整體起點，其他天用前一天最後一個景點（若無則用整體起點）
+                  const prevDayLast =
+                    dayIdx > 0 && plan[dayIdx - 1].pois.length > 0
+                      ? plan[dayIdx - 1].pois[plan[dayIdx - 1].pois.length - 1]
+                      : null;
+                  const firstAnchor =
+                    dayIdx === 0 || !prevDayLast
+                      ? routeStartRef.current
+                      : { lat: prevDayLast.lat, lng: prevDayLast.lng };
+
+                  let dailyTotalKm = 0;
+
+                  return (
                   <div key={day.day} className="border rounded-xl p-3">
                     <div className="font-semibold">
                       第 {day.day} 天 · {destination}
                     </div>
                     <ol className="list-decimal ml-5 mt-1 space-y-1">
-                      {day.pois.map((p, i) => (
+                        {day.pois.map((p, i) => {
+                          // 第 1 景點：起算點 → 第 1 景點；其餘：上一景點 → 本景點
+                          const anchor =
+                            i === 0
+                              ? firstAnchor
+                              : { lat: day.pois[i - 1].lat, lng: day.pois[i - 1].lng };
+
+                          let legKm = 0;
+                          if (anchor) legKm = haversineKm(anchor, { lat: p.lat, lng: p.lng });
+                          dailyTotalKm += legKm;
+
+                          return (
                         <li key={i}>
-                          <div className="font-medium">{p.name}</div>
+                              <div className="font-medium flex items-center gap-2">
+                                <span>{p.name}</span>
+                                {p._type && (
+                                  <span className={`text-[10px] px-2 py-0.5 rounded-full border ${typeBadgeClass(p._type)}`}>
+                                    {typeLabel(p._type)}
+                                  </span>
+                                )}
+                              </div>
                           {p.address && <div className="text-xs text-slate-600">{p.address}</div>}
+                              {anchor && (
+                                <div className="text-xs text-slate-500">
+                                  距上個點：{fmtDistance(legKm)}
+                                </div>
+                              )}
                         </li>
-                      ))}
+                          );
+                        })}
                     </ol>
+
+                      {day.pois.length > 0 && (
+                        <div className="text-xs text-slate-500 mt-2">
+                          本日景點間直線距離合計：約 {fmtDistance(dailyTotalKm)}
+                        </div>
+                      )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </Panel>

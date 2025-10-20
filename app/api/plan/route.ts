@@ -11,42 +11,19 @@ type PlaceOut = {
   address?: string;
   rating?: number;
   place_id?: string;
-  _type?: 'tourist_attraction' | 'restaurant' | 'lodging';
+  _type: 'tourist_attraction' | 'restaurant' | 'lodging';
 };
 
 const LANG = 'zh-TW';
-const POI_LIMIT = 40;
-
-// 沿途採樣與搜尋參數
-const ALONG_ROUTE_STEP_KM = 25;      // 取樣間距（公里）
-const ALONG_ROUTE_MAX_SAMPLES = 12;  // 最多取樣點
-const ALONG_RADIUS_M = 5000;         // 每個取樣點搜尋半徑（公尺）
-const ALONG_TYPES = ['tourist_attraction', 'restaurant', 'lodging'] as const;
-
-// 預設 POIs（無 Google 金鑰時的後援）
-const PRESET_POIS: Record<string, { name: string; lat: number; lng: number }[]> = {
-  墾丁: [
-    { name: '鵝鑾鼻燈塔', lat: 21.9027, lng: 120.8526 },
-    { name: '白沙灣', lat: 21.9562, lng: 120.7393 },
-    { name: '墾丁大街', lat: 21.9487, lng: 120.7829 },
-    { name: '船帆石', lat: 21.9399, lng: 120.8426 },
-    { name: '小灣海水浴場', lat: 21.9466, lng: 120.7816 },
-  ],
-  台南: [
-    { name: '赤崁樓', lat: 22.9971, lng: 120.2028 },
-    { name: '安平古堡', lat: 23.0012, lng: 120.1597 },
-    { name: '花園夜市', lat: 22.9997, lng: 120.2122 },
-  ],
-  花蓮: [
-    { name: '太魯閣國家公園', lat: 24.1577, lng: 121.6219 },
-    { name: '七星潭', lat: 24.0302, lng: 121.6271 },
-  ],
-};
+const TYPES = ['tourist_attraction', 'restaurant', 'lodging'] as const;
+const TYPE_SET = new Set(TYPES);
+const NEAR_EQ_KM = 3; // 起訖≤3km 視為同點
 
 /* ---------------- Utilities ---------------- */
 
-async function fetchJson<T = any>(url: string) {
-  const r = await fetch(url, { cache: 'no-store', headers: { 'Accept-Language': LANG } });
+async function fetchJson<T = any>(url: string, init?: RequestInit): Promise<T> {
+  const r = await fetch(url, { cache: 'no-store', ...init });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as T;
 }
 
@@ -54,19 +31,18 @@ function sleep(ms: number) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-function haversineKm(a: LatLng, b: LatLng): number {
+function haversineKm(a: LatLng, b: LatLng) {
   const R = 6371;
-  const dLat = (b.lat - a.lat) * Math.PI / 180;
-  const dLng = (b.lng - a.lng) * Math.PI / 180;
-  const la1 = a.lat * Math.PI / 180;
-  const la2 = b.lat * Math.PI / 180;
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+  const la1 = (a.lat * Math.PI) / 180;
+  const la2 = (b.lat * Math.PI) / 180;
   const s1 = Math.sin(dLat / 2);
   const s2 = Math.sin(dLng / 2);
   const c = 2 * Math.asin(Math.sqrt(s1 * s1 + Math.cos(la1) * Math.cos(la2) * s2 * s2));
   return R * c;
 }
 
-// 路徑長度累積
 function cumulativeLengthKm(path: LatLng[]): number[] {
   const acc: number[] = [0];
   for (let i = 1; i < path.length; i++) {
@@ -75,61 +51,50 @@ function cumulativeLengthKm(path: LatLng[]): number[] {
   return acc;
 }
 
-// 依路線總長等比取樣（頭尾都會包含），避免短段空白
-function sampleAlongPath(path: LatLng[], stepKm = ALONG_ROUTE_STEP_KM, maxSamples = ALONG_ROUTE_MAX_SAMPLES): LatLng[] {
-  if (!path.length) return [];
+/** 動態等距採樣：以總長約分成 ~15 段，步距限制 20–50km，樣本數上限 24 */
+function sampleAlongPathDynamic(path: LatLng[]): LatLng[] {
+  if (path.length === 0) return [];
   const cum = cumulativeLengthKm(path);
-  const total = cum[cum.length - 1];
+  const total = cum[cum.length - 1]; // km
   if (total === 0) return [path[0]];
 
-  const n = Math.min(maxSamples, Math.max(2, Math.floor(total / stepKm) + 1));
+  const stepKm = Math.max(20, Math.min(50, total / 15));
+  const n = Math.min(24, Math.max(2, Math.round(total / stepKm) + 1));
   const samples: LatLng[] = [];
   for (let i = 0; i < n; i++) {
     const target = (i / (n - 1)) * total;
+    // 在 cum 中找到第一個 >= target 的點
     let j = 0;
     while (j < cum.length && cum[j] < target) j++;
     if (j === 0) samples.push(path[0]);
     else if (j >= cum.length) samples.push(path[path.length - 1]);
     else {
       const t0 = cum[j - 1], t1 = cum[j];
-      const ratio = t1 === t0 ? 0 : (target - t0) / (t1 - t0);
       const A = path[j - 1], B = path[j];
+      const ratio = t1 === t0 ? 0 : (target - t0) / (t1 - t0);
       samples.push({ lat: A.lat + (B.lat - A.lat) * ratio, lng: A.lng + (B.lng - A.lng) * ratio });
     }
   }
-  return samples;
-}
 
-// 將某個點對應到 polyline 上「最近的頂點索引」：用來排序／分段
-function nearestIndexOnPath(p: LatLng, path: LatLng[]): number {
-  let best = 0;
-  let bestD = Infinity;
-  for (let i = 0; i < path.length; i++) {
-    const d = haversineKm(p, path[i]);
-    if (d < bestD) {
-      bestD = d;
-      best = i;
+  // 相近點去重（<5km 視為重複）
+  const dedup: LatLng[] = [];
+  for (const p of samples) {
+    if (!dedup.some((q) => haversineKm(p, q) < 5)) dedup.push(p);
   }
-  }
-  return best;
+  return dedup;
 }
 
-// 評分（熱門度 × 近路徑程度）
-function scorePlace(p: any, distKm?: number) {
-  const rating = p.rating || 0;
-  const urt = p.user_ratings_total || 1;
-  const pop = Math.log10(urt + 1) + 1;
-  const proximity = typeof distKm === 'number' ? 1 / (1 + distKm / 5) : 1; // 5km 半距離
-  return rating * pop * proximity;
+/** 根據總距離動態決定 radius（5–15km） */
+function dynamicRadiusMeters(totalKm: number) {
+  const m = Math.round(totalKm * 20) * 1; // 1km ≈ 20m*?（450km→9000m≈9km）
+  return Math.min(15000, Math.max(5000, m));
 }
 
-/* ---------------- Google：Geocode / Directions ---------------- */
+/* ---------------- Google APIs ---------------- */
 
 async function geocodeGoogle(query: string): Promise<LatLng & { formatted: string }> {
   const key = process.env.GOOGLE_MAPS_API_KEY!;
   const base = 'https://maps.googleapis.com/maps/api/geocode/json';
-
-  // 先偏好台灣，沒結果再全域
   const tw = `${base}?address=${encodeURIComponent(query)}&language=${LANG}&region=tw&key=${key}`;
   let j = await fetchJson<any>(tw);
   if (!j.results?.[0]) {
@@ -162,64 +127,105 @@ async function routeGoogle(origin: string, destination: string) {
   };
 }
 
-/* ---------------- Google：Along-route Places（多類型） ---------------- */
-
-async function nearbyAt(center: LatLng, type: typeof ALONG_TYPES[number]) {
+async function nearbyAt(center: LatLng, type: (typeof TYPES)[number], radiusM: number, keyword?: string) {
   const key = process.env.GOOGLE_MAPS_API_KEY!;
   const url =
     `https://maps.googleapis.com/maps/api/place/nearbysearch/json` +
     `?location=${center.lat},${center.lng}` +
-    `&radius=${ALONG_RADIUS_M}` +
+    `&radius=${radiusM}` +
     `&type=${encodeURIComponent(type)}` +
-    `&language=${LANG}` +
-    `&key=${key}`;
-  return await fetchJson<any>(url);
+    (keyword ? `&keyword=${encodeURIComponent(keyword)}` : '') +
+    `&language=${LANG}&key=${key}`;
+  const j = await fetchJson<any>(url);
+  if (j.status && j.status !== 'OK' && j.status !== 'ZERO_RESULTS') return [];
+  return Array.isArray(j.results) ? j.results : [];
 }
 
-async function placesAlongRoute(path: LatLng[]): Promise<PlaceOut[]> {
-  const samples = sampleAlongPath(path);
-  const byId = new Map<string, { p: any; score: number; type: PlaceOut['_type'] }>();
+/** 單點模式：以 destination 為中心，多類型 Nearby 合併去重 */
+async function placesSingleCenter(center: LatLng, radiusM = 3000): Promise<PlaceOut[]> {
+  const byId = new Map<string, { item: PlaceOut; score: number }>();
 
-  for (const s of samples) {
-    for (const t of ALONG_TYPES) {
-      const j = await nearbyAt(s, t);
-      if (!j || (j.status && j.status !== 'OK' && j.status !== 'ZERO_RESULTS')) {
-        // 忽略錯誤，繼續下一筆
-      } else {
-        for (const p of j.results ?? []) {
+  for (const t of TYPES) {
+    const arr = await nearbyAt(center, t, radiusM);
+    for (const p of arr) {
           const id = p.place_id as string | undefined;
           if (!id) continue;
-          const loc = p.geometry?.location;
-          const distKm = loc ? haversineKm({ lat: loc.lat, lng: loc.lng }, s) : undefined;
-          const sc = scorePlace(p, distKm);
+      const rating = p.rating || 0;
+      const urt = p.user_ratings_total || 1;
+      const pop = Math.log10(urt + 1) + 1;
+      const s = rating * pop;
+      const item: PlaceOut = {
+        name: p.name,
+        lat: p.geometry?.location?.lat,
+        lng: p.geometry?.location?.lng,
+        address: p.vicinity || p.formatted_address,
+        rating: p.rating,
+        place_id: id,
+        _type: t,
+      };
           const cur = byId.get(id);
-          if (!cur || sc > cur.score) byId.set(id, { p, score: sc, type: t });
-        }
+      if (!cur || s > cur.score) byId.set(id, { item, score: s });
+    }
+    await sleep(120);
+  }
+
+  return Array.from(byId.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 40)
+    .map((x) => x.item);
+}
+
+/** 沿途模式：依折線動態等距採樣，對每個採樣點 × 多類型 Nearby，合併/去重/排序 */
+async function placesAlongRoute(path: LatLng[]): Promise<PlaceOut[]> {
+  if (path.length === 0) return [];
+  const samples = sampleAlongPathDynamic(path);
+  const totalKm = haversineKm(path[0], path[path.length - 1]);
+  const radiusM = dynamicRadiusMeters(totalKm);
+
+  const byId = new Map<string, { item: PlaceOut; score: number }>();
+
+  for (const s of samples) {
+    for (const t of TYPES) {
+      const arr = await nearbyAt(s, t, radiusM);
+      for (const p of arr) {
+        const id = p.place_id as string | undefined;
+        if (!id) continue;
+
+        const baseLoc = p.geometry?.location
+          ? { lat: p.geometry.location.lat, lng: p.geometry.location.lng }
+          : null;
+        const distKm = baseLoc ? haversineKm(s, baseLoc) : undefined;
+
+        const rating = p.rating || 0;
+        const urt = p.user_ratings_total || 1;
+        const pop = Math.log10(urt + 1) + 1;
+        const proximity = typeof distKm === 'number' ? 1 / (1 + distKm / 5) : 1; // 5km 半距離
+        const sscore = rating * pop * proximity;
+
+        const item: PlaceOut = {
+      name: p.name,
+          lat: baseLoc?.lat!,
+          lng: baseLoc?.lng!,
+      address: p.vicinity || p.formatted_address,
+    rating: p.rating,
+          place_id: id,
+          _type: t,
+        };
+
+        const cur = byId.get(id);
+        if (!cur || sscore > cur.score) byId.set(id, { item, score: sscore });
       }
-      await sleep(100); // 輕量節流
+      await sleep(100); // 輕節流
     }
   }
 
-  // 轉成輸出格式，並標上 _type
-  const arr: PlaceOut[] = Array.from(byId.values()).map(({ p, type }) => ({
-      name: p.name,
-      lat: p.geometry.location.lat,
-      lng: p.geometry.location.lng,
-      address: p.vicinity || p.formatted_address,
-    rating: p.rating,
-      place_id: p.place_id,
-      _type: type,
-  }));
-
-  // ✅ 智慧排序：依 POI 在 polyline 上「最近索引」排序（確保行進方向一致）
-  const withIdx = arr.map((x) => ({ x, idx: nearestIndexOnPath({ lat: x.lat, lng: x.lng }, path) }));
-  withIdx.sort((a, b) => a.idx - b.idx);
-
-  // 取前 POI_LIMIT
-  return withIdx.slice(0, POI_LIMIT).map((v) => v.x);
+  return Array.from(byId.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 40)
+    .map((x) => x.item);
 }
 
-/* ---------------- OSM / OSRM 後援 ---------------- */
+/* ---------------- OSM/OSRM fallback（無 Google Key） ---------------- */
 
 async function geocodeOSM(query: string) {
   const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`;
@@ -259,25 +265,20 @@ export async function POST(req: NextRequest) {
     const hasGoogle = !!process.env.GOOGLE_MAPS_API_KEY;
 
     if (hasGoogle) {
-      // 取得路線
       const r = await routeGoogle(origin, destination);
 
-      // 依沿途搜尋多類型地點並排序到行進方向
-      let pois = await placesAlongRoute(r.polyline);
+      // 判斷是否「單點」：起訖距離 ≤ NEAR_EQ_KM
+      const isSingle =
+        haversineKm({ lat: r.start.lat, lng: r.start.lng }, { lat: r.end.lat, lng: r.end.lng }) <= NEAR_EQ_KM;
 
-      // ✅ 依「路線進度比例」把 POIs 重新「分日排序」後再扁平化（前端可以等分切也會接近）
-      const L = r.polyline.length - 1 || 1;
-      const poisWithIdx = pois.map((p) => ({
-        p,
-        idx: nearestIndexOnPath({ lat: p.lat, lng: p.lng }, r.polyline),
-      }));
-      // dayIndex ∈ [0, days-1]
-      for (const it of poisWithIdx) {
-        const ratio = it.idx / L;
-        (it as any).dayIndex = Math.min(days - 1, Math.max(0, Math.floor(ratio * days)));
+      let pois: PlaceOut[] = [];
+      if (isSingle) {
+        // 單點模式：用起點做多類型 Nearby（或用終點都可，差異不大）
+        pois = await placesSingleCenter({ lat: r.start.lat, lng: r.start.lng }, 3000);
+      } else {
+        // 沿途模式：動態採樣 + 多類型 Nearby
+        pois = await placesAlongRoute(r.polyline);
       }
-      poisWithIdx.sort((a, b) => (a as any).dayIndex - (b as any).dayIndex || a.idx - b.idx);
-      pois = poisWithIdx.map((v) => v.p);
 
       return NextResponse.json(
         {
@@ -287,16 +288,15 @@ export async function POST(req: NextRequest) {
           end: { lat: r.end.lat, lng: r.end.lng, address: r.end.address },
           distanceText: r.distanceText,
           durationText: r.durationText,
-          pois, // 已依行進方向 + 分日順序排好
+          pois,
         },
         { headers: { 'Cache-Control': 'private, max-age=60' } }
       );
     } else {
-      // 後援路線（無 Google）
+      // 無 Google Key：使用 OSM/OSRM（本模式不含 Places）
       const o = await geocodeOSM(origin);
       const d = await geocodeOSM(destination);
       const r = await routeOSRM({ lat: o.lat, lng: o.lng }, { lat: d.lat, lng: d.lng });
-      const preset = PRESET_POIS[destination] || [];
       return NextResponse.json(
         {
           provider: 'osrm',
@@ -305,15 +305,16 @@ export async function POST(req: NextRequest) {
           end: { lat: d.lat, lng: d.lng, address: d.formatted },
           distanceText: r.distanceText,
           durationText: r.durationText,
-          pois: preset,
+          pois: [] as PlaceOut[],
         },
         { headers: { 'Cache-Control': 'no-store' } }
       );
     }
   } catch (e: any) {
+    const status = e?.name === 'AbortError' ? 504 : 500;
     return NextResponse.json(
       { error: 'server_error', detail: e?.message || 'Unknown error' },
-      { status: 500, headers: { 'Cache-Control': 'no-store' } }
+      { status, headers: { 'Cache-Control': 'no-store' } }
     );
   }
 }

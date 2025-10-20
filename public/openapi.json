@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Tripi Pro API",
-    "version": "1.1.0",
-    "description": "Tripi 旅遊助理 API：多日路線規劃與附近地點探索。伺服器端代理 Google Maps/Places，前端無需暴露金鑰。"
+    "version": "1.2.0",
+    "description": "Tripi 旅遊助理 API：多日路線規劃、附近地點探索、景點詳情，與天氣代理（伺服端代理 OpenWeather，回傳穿著建議）。"
   },
   "servers": [
     {
@@ -85,11 +85,19 @@
           },
           "400": {
             "description": "Bad request",
-            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "properties": { "error": { "type": "string" } } }
+              }
+            }
           },
           "500": {
             "description": "Server error",
-            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "properties": { "error": { "type": "string" } } }
+              }
+            }
           }
         }
       }
@@ -158,7 +166,7 @@
                           "place_id": { "type": "string" },
                           "rating": { "type": "number" },
                           "user_ratings_total": { "type": "integer" },
-                          "_type": { "type": "string", "description": "來源的類型（呼叫時的 type 值）" },
+                          "_type": { "type": "string" },
                           "location": {
                             "type": "object",
                             "properties": {
@@ -173,14 +181,6 @@
                 }
               }
             }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
-          },
-          "500": {
-            "description": "Server error",
-            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
           }
         }
       }
@@ -236,14 +236,86 @@
                   }
                 }
               }
+          }
+        }
+      }
           },
-          "400": {
-            "description": "Bad request",
-            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+
+    "/api/weather": {
+      "get": {
+        "operationId": "getWeather",
+        "summary": "即時天氣（代理 OpenWeather，含 outfit_advice）",
+        "parameters": [
+          { "name": "q", "in": "query", "schema": { "type": "string", "maxLength": 60 }, "description": "城市名稱（例如 Taipei,London）" },
+          { "name": "lat", "in": "query", "schema": { "type": "number", "minimum": -90, "maximum": 90 }, "description": "緯度" },
+          { "name": "lon", "in": "query", "schema": { "type": "number", "minimum": -180, "maximum": 180 }, "description": "經度" },
+          { "name": "units", "in": "query", "schema": { "type": "string", "enum": ["standard","metric","imperial"], "default": "metric" } },
+          { "name": "lang", "in": "query", "schema": { "type": "string", "default": "zh_tw" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "OpenWeather 資料 + outfit_advice",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "coord": { "type": "object" },
+                    "weather": { "type": "array", "items": { "type": "object" } },
+                    "main": { "type": "object" },
+                    "wind": { "type": "object" },
+                    "rain": { "type": "object", "nullable": true },
+                    "snow": { "type": "object", "nullable": true },
+                    "name": { "type": "string" },
+                    "outfit_advice": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
           },
-          "500": {
-            "description": "Server error",
-            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+
+    "/api/forecast": {
+      "get": {
+        "operationId": "getForecast",
+        "summary": "五日天氣預報（代理 OpenWeather，含每格 outfit_advice）",
+        "parameters": [
+          { "name": "q", "in": "query", "schema": { "type": "string", "maxLength": 60 } },
+          { "name": "lat", "in": "query", "schema": { "type": "number", "minimum": -90, "maximum": 90 } },
+          { "name": "lon", "in": "query", "schema": { "type": "number", "minimum": -180, "maximum": 180 } },
+          { "name": "units", "in": "query", "schema": { "type": "string", "enum": ["standard","metric","imperial"], "default": "metric" } },
+          { "name": "lang", "in": "query", "schema": { "type": "string", "default": "zh_tw" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "OpenWeather 預報 + 每格 outfit_advice",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "city": { "type": "object" },
+                    "list": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "dt_txt": { "type": "string" },
+                          "main": { "type": "object" },
+                          "weather": { "type": "array", "items": { "type": "object" } },
+                          "wind": { "type": "object" },
+                          "rain": { "type": "object", "nullable": true },
+                          "snow": { "type": "object", "nullable": true },
+                          "tripi": { "type": "object", "properties": { "outfit_advice": { "type": "string" } } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }

@@ -1,316 +1,927 @@
-﻿// app/api/plan/route.ts
-import { NextRequest, NextResponse } from 'next/server';
-import polyline from 'polyline';
+﻿/// <reference types="@types/google.maps" />
 
-type LatLng = { lat: number; lng: number };
-type PlaceType = 'tourist_attraction' | 'restaurant' | 'lodging';
-type PlaceOut = {
+'use client';
+
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { readInitParams, listen, send } from '../../lib/apps-bridge';
+
+// ---------------- Types ----------------
+
+type POI = {
   name: string;
   lat: number;
   lng: number;
   address?: string;
   rating?: number;
-  place_id?: string;
-  _type: PlaceType;
-  city?: string; // 反向地理編碼後加上
+  _type?: 'tourist_attraction' | 'restaurant' | 'lodging';
+};
+type DayPlan = { day: number; city: string; pois: POI[] };
+
+type PlanResponse = {
+  provider: 'google' | 'osrm';
+  polyline: [number, number][];
+  start: { lat: number; lng: number; address: string };
+  end: { lat: number; lng: number; address: string };
+  distanceText: string;
+  durationText: string;
+  pois: POI[];
 };
 
-type DaySlot = {
-  morning: PlaceOut[]; // 景點 1–2
-  lunch?: PlaceOut;    // 餐廳 1
-  afternoon: PlaceOut[]; // 景點 1–2
-  lodging?: PlaceOut;    // 住宿 1
-};
+// ---------------- UI ----------------
 
-const LANG = 'zh-TW';
-const TYPES: PlaceType[] = ['tourist_attraction', 'restaurant', 'lodging'];
-const NEAR_EQ_KM = 3;
-
-function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
-async function fetchJson<T=any>(url: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(url, { cache: 'no-store', ...init });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() as Promise<T>;
-}
-function haversineKm(a: LatLng, b: LatLng) {
-  const R=6371; const dLat=(b.lat-a.lat)*Math.PI/180, dLng=(b.lng-a.lng)*Math.PI/180;
-  const la1=a.lat*Math.PI/180, la2=b.lat*Math.PI/180;
-  const s1=Math.sin(dLat/2), s2=Math.sin(dLng/2);
-  return 2*R*Math.asin(Math.sqrt(s1*s1+Math.cos(la1)*Math.cos(la2)*s2*s2));
-}
-function cumulativeLengthKm(path: LatLng[]) {
-  const acc=[0]; for(let i=1;i<path.length;i++) acc.push(acc[i-1]+haversineKm(path[i-1],path[i])); return acc;
-}
-function sampleAlongPathDynamic(path: LatLng[]) {
-  if (!path.length) return [];
-  const cum=cumulativeLengthKm(path), total=cum[cum.length-1];
-  if (total===0) return [path[0]];
-  const step=Math.max(20, Math.min(50, total/15)), n=Math.min(24, Math.max(2, Math.round(total/step)+1));
-  const out:LatLng[]=[];
-  for (let i=0;i<n;i++){
-    const target=(i/(n-1))*total; let j=0; while(j<cum.length && cum[j]<target) j++;
-    if (j===0) out.push(path[0]);
-    else if (j>=cum.length) out.push(path[path.length-1]);
-    else {
-      const t0=cum[j-1], t1=cum[j]; const A=path[j-1], B=path[j];
-      const r=t1===t0?0:(target-t0)/(t1-t0);
-      out.push({ lat: A.lat+(B.lat-A.lat)*r, lng: A.lng+(B.lng-A.lng)*r });
-    }
-  }
-  // 去重（<5km）
-  const dedup:LatLng[]=[]; for(const p of out){ if(!dedup.some(q=>haversineKm(p,q)<5)) dedup.push(p); }
-  return dedup;
-}
-function dynamicRadiusMeters(totalKm:number){ return Math.min(15000, Math.max(5000, Math.round(totalKm*20))); }
-
-async function geocodeGoogle(query: string): Promise<LatLng & { formatted: string }> {
-  const key=process.env.GOOGLE_MAPS_API_KEY!;
-  const base='https://maps.googleapis.com/maps/api/geocode/json';
-  let j=await fetchJson<any>(`${base}?address=${encodeURIComponent(query)}&language=${LANG}&region=tw&key=${key}`);
-  if (!j.results?.[0]) j=await fetchJson<any>(`${base}?address=${encodeURIComponent(query)}&language=${LANG}&key=${key}`);
-  if (!j.results?.[0]) throw new Error(j.error_message || 'geocode_failed');
-  const g=j.results[0]; return { lat:g.geometry.location.lat, lng:g.geometry.location.lng, formatted:g.formatted_address };
+function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="w-full lg:w-96 bg-white/90 backdrop-blur rounded-2xl shadow-xl border border-gray-100 p-4 lg:p-5 space-y-3">
+      <div className="text-xl font-semibold">{title}</div>
+      {children}
+    </div>
+  );
 }
 
-async function reverseCity(lat:number,lng:number): Promise<string|undefined> {
-  const key=process.env.GOOGLE_MAPS_API_KEY!;
-  const url=`https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&language=${LANG}&key=${key}`;
-  const j=await fetchJson<any>(url);
-  const ac: any[] = j.results?.[0]?.address_components || [];
-  const find = (t:string)=>ac.find(c=>c.types?.includes(t))?.long_name;
-  const lvl1=find('administrative_area_level_1');
-  const lvl2=find('administrative_area_level_2') || find('locality');
-  const sub =find('sublocality_level_1') || find('political');
-  const parts=[lvl2, sub].filter(Boolean);
-  return parts.length ? parts.join(' ') : lvl1 || undefined;
-}
+// ---------------- Google Maps Loader ----------------
 
-async function routeGoogle(origin:string, destination:string){
-  const key=process.env.GOOGLE_MAPS_API_KEY!;
-  const url=`https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&language=${LANG}&region=tw&mode=driving&key=${key}`;
-  const j=await fetchJson<any>(url);
-  if (j.status!=='OK' || !j.routes?.[0]) throw new Error(j.error_message||j.status||'directions_failed');
-  const route=j.routes[0], leg=route.legs[0];
-  const coords=polyline.decode(route.overview_polyline.points).map(([lat,lng]:[number,number])=>({lat,lng}));
-  return {
-    polyline: coords as LatLng[],
-    start: { lat: leg.start_location.lat, lng: leg.start_location.lng, address: leg.start_address },
-    end:   { lat: leg.end_location.lat,   lng: leg.end_location.lng,   address: leg.end_address },
-    distanceText: leg.distance.text, durationText: leg.duration.text,
-  };
-}
+function useGoogleMaps(apiKey?: string) {
+  const [ready, setReady] = useState(false);
 
-async function nearby(center:LatLng, type:PlaceType, radiusM:number) {
-  const key=process.env.GOOGLE_MAPS_API_KEY!;
-  const url=`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${center.lat},${center.lng}&radius=${radiusM}&type=${encodeURIComponent(type)}&language=${LANG}&key=${key}`;
-  const j=await fetchJson<any>(url);
-  if (j.status && j.status!=='OK' && j.status!=='ZERO_RESULTS') return [];
-  return Array.isArray(j.results)? j.results : [];
-}
+  useEffect(() => {
+    let cancelled = false;
 
-function scorePlace(p:any, distKm?:number) {
-  const rating=p.rating||0, urt=p.user_ratings_total||1;
-  const pop=Math.log10(urt+1)+1;
-  const prox= typeof distKm==='number' ? 1/(1+distKm/5) : 1;
-  return rating*pop*prox;
-}
-
-/** 沿途：多類型合併；回傳附帶 place_id/_type */
-async function placesAlongRoute(path:LatLng[]): Promise<PlaceOut[]> {
-  const samples=sampleAlongPathDynamic(path);
-  const totalKm=haversineKm(path[0], path[path.length-1]);
-  const radius=dynamicRadiusMeters(totalKm);
-  const byId=new Map<string,{item:PlaceOut,score:number,progress:number}>();
-
-  // 預先算每個點在折線上的「進度」（用最近頂點索引近似）
-  const progressOf = (pt:LatLng) => {
-    let best=0, bi=0;
-    for (let i=0;i<path.length;i++){
-      const d=haversineKm(pt, path[i]);
-      if (i===0 || d<best){ best=d; bi=i; }
-    }
-    return bi; // 以頂點索引做近似進度
-  };
-
-  for (const s of samples){
-    for (const t of TYPES){
-      const arr=await nearby(s, t, radius);
-      for (const p of arr){
-        const id=p.place_id as string|undefined; if (!id) continue;
-        const loc:LatLng={ lat:p.geometry.location.lat, lng:p.geometry.location.lng };
-        const dist=haversineKm(s, loc);
-        const sc=scorePlace(p, dist);
-        const item:PlaceOut={ name:p.name, lat:loc.lat, lng:loc.lng, address:p.vicinity||p.formatted_address, rating:p.rating, place_id:id, _type:t };
-        const pr=progressOf(loc);
-        const cur=byId.get(id);
-        if (!cur || sc>cur.score) byId.set(id, { item, score: sc, progress: pr });
+    async function load() {
+      if (typeof window === 'undefined') return;
+      if ((window as any).google?.maps) {
+        setReady(true);
+        return;
       }
-      await sleep(80);
-    }
-  }
+      if (!apiKey) return;
 
-  // 依「沿路前進進度」排序，避免一天來回南北
-  return Array.from(byId.values())
-    .sort((a,b)=> a.progress - b.progress || b.score - a.score)
-    .map(x=>x.item);
-}
-
-/** 單點：多類型 Nearby */
-async function placesSingleCenter(center:LatLng): Promise<PlaceOut[]> {
-  const byId=new Map<string,{item:PlaceOut,score:number}>();
-  for (const t of TYPES){
-    const arr=await nearby(center, t, 3000);
-    for (const p of arr){
-      const id=p.place_id as string|undefined; if (!id) continue;
-      const loc={ lat:p.geometry.location.lat, lng:p.geometry.location.lng };
-      const sc=scorePlace(p);
-      const item:PlaceOut={ name:p.name, lat:loc.lat, lng:loc.lng, address:p.vicinity||p.formatted_address, rating:p.rating, place_id:id, _type:t };
-      const cur=byId.get(id); if (!cur || sc>cur.score) byId.set(id,{item,score:sc});
-    }
-    await sleep(80);
-  }
-  return Array.from(byId.values()).sort((a,b)=>b.score-a.score).map(x=>x.item);
-}
-
-/** 以「沿路前進順序」分天，再切早/午/晚 */
-function buildAgencyStyleItinerary(pois:PlaceOut[], days:number): DaySlot[] {
-  // 只拿景點作骨架；餐廳/住宿待會填補
-  const attractions=pois.filter(p=>p._type==='tourist_attraction');
-  const perDay=Math.max(2, Math.min(4, Math.ceil(attractions.length / days))); // 每天 2–4 個景點
-  const itinerary:DaySlot[] = Array.from({length:days}, ()=>({ morning:[], afternoon:[] }));
-
-  for (let d=0; d<days; d++){
-    const seg=attractions.slice(d*perDay, (d+1)*perDay);
-    const morning = seg.slice(0, Math.min(2, seg.length));
-    const afternoon = seg.slice(morning.length, Math.min(morning.length+2, seg.length));
-    itinerary[d].morning = morning;
-    itinerary[d].afternoon = afternoon;
-  }
-
-  // 為每一天挑餐廳（靠近當日所有景點幾何中心）
-  for (let d=0; d<days; d++){
-    const slots=itinerary[d];
-    const dayPts=[...slots.morning, ...slots.afternoon];
-    if (dayPts.length===0) continue;
-    const cx=dayPts.reduce((s,p)=>s+p.lat,0)/dayPts.length;
-    const cy=dayPts.reduce((s,p)=>s+p.lng,0)/dayPts.length;
-    // 從原本 POIs 中找距離中心最近且評分高的餐廳
-    const candidates=pois.filter(p=>p._type==='restaurant');
-    let best:PlaceOut|undefined, bs=-1;
-    for (const r of candidates){
-      const sc = (r.rating||0) / (1 + haversineKm({lat:cx,lng:cy}, {lat:r.lat,lng:r.lng})/5);
-      if (sc>bs){ bs=sc; best=r; }
-    }
-    if (best) itinerary[d].lunch = best;
-  }
-
-  // 為每一天挑住宿（靠近下午最後一點；最後一天若沒有就靠近該天任意點）
-  for (let d=0; d<days; d++){
-    const slots=itinerary[d];
-    const anchor = slots.afternoon[slots.afternoon.length-1] || slots.morning[slots.morning.length-1];
-    if (!anchor) continue;
-    const hotels=pois.filter(p=>p._type==='lodging');
-    let best:PlaceOut|undefined, bs=-1;
-    for (const h of hotels){
-      const sc = (h.rating||0) / (1 + haversineKm({lat:anchor.lat,lng:anchor.lng}, {lat:h.lat,lng:h.lng})/5);
-      if (sc>bs){ bs=sc; best=h; }
-    }
-    if (best) itinerary[d].lodging = best;
-  }
-
-  return itinerary;
-}
-
-/* ---------------- OSM/OSRM fallback（無 Google Key） ---------------- */
-async function geocodeOSM(query: string) {
-  const url=`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`;
-  const r=await fetch(url,{ headers:{'Accept-Language':LANG}, cache:'no-store'}); const j=await r.json();
-  if (!Array.isArray(j)||!j[0]) throw new Error('geocode_failed');
-  return { lat: parseFloat(j[0].lat), lng: parseFloat(j[0].lon), formatted: j[0].display_name };
-}
-async function routeOSRM(origin:LatLng, dest:LatLng){
-  const url=`https://router.project-osrm.org/route/v1/driving/${origin.lng},${origin.lat};${dest.lng},${dest.lat}?overview=full&geometries=geojson`;
-  const j=await fetchJson<any>(url);
-  if (!j.routes?.[0]) throw new Error('route_failed');
-  const route=j.routes[0];
-  const coords=route.geometry.coordinates.map(([lng,lat]:[number,number])=>({lat,lng}));
-  return { polyline: coords as LatLng[], distanceText:(route.distance/1000).toFixed(1)+' km', durationText: Math.round(route.duration/60)+' 分鐘' };
-}
-
-/* ---------------- Handler ---------------- */
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const { origin, destination, days = 5 } = body || {};
-    if (!origin || !destination) {
-      return NextResponse.json({ error:'bad_request', detail:'origin/destination required' }, { status:400, headers:{'Cache-Control':'no-store'} });
-    }
-
-    const hasGoogle = !!process.env.GOOGLE_MAPS_API_KEY;
-
-    if (hasGoogle) {
-      const r = await routeGoogle(origin, destination);
-      const startLL={lat:r.start.lat,lng:r.start.lng}, endLL={lat:r.end.lat,lng:r.end.lng};
-      const isSingle = haversineKm(startLL,endLL) <= NEAR_EQ_KM;
-
-      let pois: PlaceOut[] = [];
-      if (isSingle) {
-        pois = await placesSingleCenter(startLL);
-      } else {
-        const along = await placesAlongRoute(r.polyline);
-        // 只保留前 60，避免過量
-        pois = along.slice(0, 60);
+      const src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places`;
+      if (document.querySelector(`script[src^="https://maps.googleapis.com/maps/api/js"]`)) {
+        const trySet = () => {
+          if ((window as any).google?.maps) setReady(true);
+          else setTimeout(trySet, 200);
+        };
+        trySet();
+        return;
       }
 
-      // === 依「旅行社風格」產出 itinerary（避免同日拉鋸） ===
-      const itinerary = buildAgencyStyleItinerary(pois, days);
-
-      // === 只對「入選的點」補上 city 並把 city 前置到 address ===
-      const chosen = new Set<string>();
-      itinerary.forEach(d=>{
-        [...d.morning, d.lunch, ...d.afternoon, d.lodging].forEach((p:any)=>{
-          if (p?.place_id) chosen.add(p.place_id);
-        });
+      await new Promise<void>((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.async = true;
+        s.defer = true;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error('gmaps_load_error'));
+        document.head.appendChild(s);
       });
 
-      for (const p of pois) {
-        if (!p.place_id || !chosen.has(p.place_id)) continue;
-        try {
-          const city = await reverseCity(p.lat, p.lng);
-          p.city = city;
-          if (p.address) {
-            p.address = city ? `${city} · ${p.address}` : p.address;
-          } else if (city) {
-            p.address = city;
-          }
-          await sleep(50);
-        } catch {}
+      if (!cancelled) {
+        if ((window as any).google?.maps) setReady(true);
       }
-
-      return NextResponse.json({
-        provider: 'google',
-        polyline: r.polyline.map(({lat,lng})=>[lat,lng]) as [number,number][],
-        start: { lat:r.start.lat, lng:r.start.lng, address:r.start.address },
-        end:   { lat:r.end.lat,   lng:r.end.lng,   address:r.end.address },
-        distanceText: r.distanceText,
-        durationText: r.durationText,
-        pois,            // 舊欄位（扁平）
-        itinerary,       // 新欄位（早/午/晚）
-      }, { headers: { 'Cache-Control': 'private, max-age=60' }});
-
-    } else {
-      const o=await geocodeOSM(origin), d=await geocodeOSM(destination);
-      const ro=await routeOSRM({lat:o.lat,lng:o.lng},{lat:d.lat,lng:d.lng});
-      return NextResponse.json({
-        provider:'osrm',
-        polyline: ro.polyline.map(({lat,lng})=>[lat,lng]) as [number,number][],
-        start:{lat:o.lat,lng:o.lng, address:o.formatted},
-        end:{lat:d.lat,lng:d.lng, address:d.formatted},
-        distanceText: ro.distanceText, durationText: ro.durationText,
-        pois:[], itinerary:[],
-      }, { headers:{'Cache-Control':'no-store'}});
     }
-  } catch (e:any) {
-    const status = e?.name==='AbortError' ? 504 : 500;
-    return NextResponse.json({ error:'server_error', detail:e?.message||'Unknown error' }, { status, headers:{'Cache-Control':'no-store'} });
+
+    load().catch(() => setReady(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [apiKey]);
+
+  return ready;
+}
+
+// ---------------- Helpers ----------------
+
+// 藍色大頭針（像預設紅色，但換成藍色）
+function userBluePinIcon(): google.maps.Icon {
+  const svg =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24">' +
+    '<path d="M12 2c-4.97 0-9 3.88-9 8.67 0 6.5 9 13.66 9 13.66s9-7.16 9-13.66C21 5.88 16.97 2 12 2z" fill="#2563EB" stroke="#1E3A8A" stroke-width="1.2"/>' +
+    '<circle cx="12" cy="10" r="3.2" fill="#ffffff"/>' +
+    '</svg>';
+  return {
+    url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg),
+    scaledSize: new google.maps.Size(36, 36),
+    anchor: new google.maps.Point(18, 34), // 尖端
+  };
+}
+
+// 嘗試解析 "lat,lng"
+function parseLatLng(text: string): google.maps.LatLngLiteral | null {
+  const m = text.trim().match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (!m) return null;
+  const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
+  if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  return { lat, lng };
+}
+
+// 直線距離（哈弗辛公式）+ 顯示格式
+function haversineKm(a: { lat: number; lng: number }, b: { lat: number; lng: number }) {
+  const R = 6371;
+  const dLat = (b.lat - a.lat) * Math.PI / 180;
+  const dLng = (b.lng - a.lng) * Math.PI / 180;
+  const lat1 = a.lat * Math.PI / 180;
+  const lat2 = b.lat * Math.PI / 180;
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLng = Math.sin(dLng / 2);
+  const c = 2 * Math.asin(Math.sqrt(sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLng * sinDLng));
+  return R * c;
+}
+function fmtDistance(km: number) {
+  return km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
+}
+
+// 小徽章：型別 → 標籤 & 樣式
+function typeLabel(t?: string) {
+  if (t === 'restaurant') return '餐廳';
+  if (t === 'lodging') return '住宿';
+  if (t === 'tourist_attraction') return '景點';
+  return null;
+}
+function typeBadgeClass(t?: string) {
+  if (t === 'restaurant') return 'bg-rose-50 text-rose-700 border-rose-200';
+  if (t === 'lodging') return 'bg-indigo-50 text-indigo-700 border-indigo-200';
+  if (t === 'tourist_attraction') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+  return 'bg-slate-50 text-slate-700 border-slate-200';
+}
+
+// ---------------- Component ----------------
+
+export default function WidgetClient() {
+  // Map refs
+  const mapRef = useRef<HTMLDivElement>(null);
+  const mapInst = useRef<google.maps.Map | null>(null);
+  const routePolylineRef = useRef<google.maps.Polyline | null>(null); // 路線折線
+  const routeMarkersRef = useRef<google.maps.Marker[]>([]); // S/E 兩點
+  const poiMarkersRef = useRef<google.maps.Marker[]>([]); // 行程 POI（跟 Nearby 分離）
+  const nearbyMarkersRef = useRef<google.maps.Marker[]>([]); // 附近探索（紅色）標記
+  const userMarkerRef = useRef<google.maps.Marker | null>(null); // 目前位置（藍色針）
+  const customCenterMarkerRef = useRef<google.maps.Marker | null>(null); // 自訂搜尋中心
+  const searchCircleRef = useRef<google.maps.Circle | null>(null); // 搜尋範圍圓（藍系）
+  const mapIdleListenerRef = useRef<google.maps.MapsEventListener | null>(null);
+  const mapClickListenerRef = useRef<google.maps.MapsEventListener | null>(null);
+  const watchIdRef = useRef<number | null>(null);
+  const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null); // 共用 InfoWindow
+  const routeStartRef = useRef<{ lat: number; lng: number } | null>(null); // 記住整體起點
+
+  // 自訂搜尋中心
+  const [centerInput, setCenterInput] = useState(''); // 可輸入座標或景點/地址
+  const centerInputRef = useRef<HTMLInputElement | null>(null);
+  const [pickOnMap, setPickOnMap] = useState(false);
+
+  // Trip inputs
+  const [origin, setOrigin] = useState('台北');
+  const [destination, setDestination] = useState('墾丁');
+  const [days, setDays] = useState(5);
+
+  // States
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string>('');
+  const [routeInfo, setRouteInfo] = useState<{
+    distance: string;
+    duration: string;
+    start: string;
+    end: string;
+  } | null>(null);
+  const [plan, setPlan] = useState<DayPlan[]>([]);
+
+  // Nearby controls
+  const [types, setTypes] = useState<string[]>(['tourist_attraction', 'restaurant']);
+  const [radius, setRadius] = useState(1500);             // 實際半徑（number）
+  const [radiusInput, setRadiusInput] = useState('1500'); // 顯示用字串（允許清空）
+  const [keyword, setKeyword] = useState('');
+  const [showCircle, setShowCircle] = useState(true);
+  const [autoUpdateOnDrag, setAutoUpdateOnDrag] = useState(true);
+  const [followMe, setFollowMe] = useState(false);
+  const [nearbyLoading, setNearbyLoading] = useState(false);
+
+  const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
+  const gmapsReady = useGoogleMaps(apiKey);
+
+  // 初始化地圖
+  useEffect(() => {
+    if (!gmapsReady || !mapRef.current || mapInst.current) return;
+    mapInst.current = new google.maps.Map(mapRef.current, {
+      center: { lat: 23.6978, lng: 120.9605 },
+      zoom: 7,
+      mapTypeControl: false,
+      fullscreenControl: false,
+      streetViewControl: false,
+    });
+
+    // 嘗試抓目前位置
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const userPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          mapInst.current!.setCenter(userPos);
+          mapInst.current!.setZoom(13);
+          if (userMarkerRef.current) userMarkerRef.current.setMap(null);
+          userMarkerRef.current = new google.maps.Marker({
+            position: userPos,
+            map: mapInst.current!,
+            icon: userBluePinIcon(),
+            title: '目前位置',
+            zIndex: 9999,
+          });
+          if (showCircle) drawSearchCircle(mapInst.current!.getCenter()!);
+        },
+        () => {
+          if (showCircle) drawSearchCircle(mapInst.current!.getCenter()!);
+        },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+      );
+    } else {
+      if (showCircle) drawSearchCircle(mapInst.current.getCenter()!);
+    }
+
+    attachIdleListener();
+  }, [gmapsReady]);
+
+  // 初始化 Places Autocomplete（自訂中心輸入框）
+  useEffect(() => {
+    if (!gmapsReady || !centerInputRef.current) return;
+    const ac = new google.maps.places.Autocomplete(centerInputRef.current, {
+      fields: ['geometry', 'name', 'formatted_address'],
+      types: ['geocode', 'establishment'],
+    });
+    const listener = ac.addListener('place_changed', () => {
+      const place = ac.getPlace();
+      const loc = place?.geometry?.location;
+      if (loc) {
+        const p = { lat: loc.lat(), lng: loc.lng() };
+        setCenterInput(place.formatted_address || place.name || (p.lat + ',' + p.lng));
+        setCustomCenter(p);
+      }
+    });
+    return () => listener.remove();
+  }, [gmapsReady]);
+
+  // Apps bridge init/listeners
+  useEffect(() => {
+    const params = readInitParams();
+    if (params.origin) setOrigin(params.origin);
+    if (params.destination) setDestination(params.destination);
+    if (params.days) setDays(params.days);
+    if (params.origin && params.destination) {
+      setTimeout(() => planTrip(), 10);
+    }
+
+    const off = listen((msg: any) => {
+      if (msg.type === 'init' || msg.type === 'set') {
+        if (msg.payload.origin) setOrigin(msg.payload.origin);
+        if (msg.payload.destination) setDestination(msg.payload.destination);
+        if (typeof msg.payload.days === 'number') setDays(msg.payload.days);
+        if (msg.type === 'init') setTimeout(() => planTrip(), 10);
+      } else if (msg.type === 'ping') {
+        send({ type: 'ready' });
+      }
+    });
+
+    send({ type: 'ready' });
+    return () => {
+      if (typeof off === 'function') off();
+    };
+  }, []);
+
+  const testCases = useMemo(
+    () => [
+      { label: '台北 → 墾丁 · 5 天', origin: '台北', destination: '墾丁', days: 5 },
+      { label: '台中 → 花蓮 · 3 天', origin: '台中', destination: '花蓮', days: 3 },
+      { label: '高雄 → 台南 · 2 天', origin: '高雄', destination: '台南', days: 2 },
+    ],
+    []
+  );
+
+  function applyCase(c: { label: string; origin: string; destination: string; days: number }) {
+    setOrigin(c.origin);
+    setDestination(c.destination);
+    setDays(c.days);
   }
+
+  // ---------------- Trip planning ----------------
+
+  async function planTrip() {
+    if (!gmapsReady || !mapInst.current) return;
+    setLoading(true);
+    setError('');
+    setPlan([]);
+    setRouteInfo(null);
+
+    try {
+      const res = await fetch('/api/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ origin, destination, days }),
+      });
+      if (!res.ok) throw new Error('API error');
+      const data: PlanResponse = await res.json();
+
+      const g = google.maps;
+
+      // 清除舊路線（保留?、圓、行程POI、自訂中心與 Nearby 標記）
+      if (routePolylineRef.current) {
+        routePolylineRef.current.setMap(null);
+        routePolylineRef.current = null;
+      }
+      routeMarkersRef.current.forEach((m) => m.setMap(null));
+      routeMarkersRef.current = [];
+
+      // 畫路線
+      const polyPath = data.polyline.map(([lat, lng]) => ({ lat, lng }));
+      routePolylineRef.current = new g.Polyline({
+        path: polyPath,
+        strokeWeight: 5,
+        map: mapInst.current!,
+      });
+
+      // S/E
+      routeMarkersRef.current.push(
+        new g.Marker({ position: { lat: data.start.lat, lng: data.start.lng }, map: mapInst.current!, label: 'S', title: data.start.address })
+      );
+      routeMarkersRef.current.push(
+        new g.Marker({ position: { lat: data.end.lat, lng: data.end.lng }, map: mapInst.current!, label: 'E', title: data.end.address })
+      );
+
+      // fit bounds
+      const bounds = new g.LatLngBounds();
+      polyPath.forEach((p) => bounds.extend(p));
+      mapInst.current!.fitBounds(bounds);
+
+      // 顯示行程 POIs（取前 25）——獨立於 Nearby
+      poiMarkersRef.current.forEach((m) => m.setMap(null));
+      poiMarkersRef.current = data.pois
+        .slice(0, 25)
+        .map((p) => new g.Marker({ position: { lat: p.lat, lng: p.lng }, title: p.name, map: mapInst.current! }));
+
+      setRouteInfo({ distance: data.distanceText, duration: data.durationText, start: data.start.address, end: data.end.address });
+
+      // 記住整體起點座標（供距離計算）
+      routeStartRef.current = { lat: data.start.lat, lng: data.start.lng };
+
+      // 切天
+      const perDay = Math.max(2, Math.min(3, Math.ceil((data.pois.length || 6) / days)));
+      const daysPlan: DayPlan[] = [];
+      for (let d = 0; d < days; d++) {
+        const slice = data.pois.slice(d * perDay, (d + 1) * perDay);
+        daysPlan.push({ day: d + 1, city: destination, pois: slice });
+      }
+      setPlan(daysPlan);
+
+      send({ type: 'result', payload: { origin, destination, days } });
+    } catch (e: any) {
+      setError('規劃失敗，請稍後再試。' + (e?.message ? '\n' + e.message : ''));
+      send({ type: 'error', message: e?.message || 'plan_failed' });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ---------------- Nearby & Circle helpers ----------------
+
+  function drawSearchCircle(center: google.maps.LatLng) {
+    if (!mapInst.current) return;
+    if (searchCircleRef.current) {
+      searchCircleRef.current.setCenter(center);
+      searchCircleRef.current.setRadius(radius);
+      searchCircleRef.current.setVisible(showCircle);
+      searchCircleRef.current.setMap(showCircle ? mapInst.current : null);
+      return;
+    }
+    searchCircleRef.current = new google.maps.Circle({
+      center,
+      radius,
+      map: mapInst.current!,
+      fillOpacity: 0.1,
+      fillColor: '#93C5FD', // blue-300
+      strokeOpacity: 0.7,
+      strokeColor: '#2563EB', // blue-600
+      strokeWeight: 2,
+    });
+    searchCircleRef.current.setVisible(showCircle);
+  }
+
+  function attachIdleListener() {
+    mapIdleListenerRef.current?.remove();
+    if (!mapInst.current || !autoUpdateOnDrag) return;
+    mapIdleListenerRef.current = mapInst.current.addListener('idle', () => {
+      if (!showCircle) return;
+      const fixed = customCenterMarkerRef.current?.getPosition();
+      drawSearchCircle(fixed ?? mapInst.current!.getCenter()!);
+    });
+  }
+
+  // radius/showCircle 更新時，立刻反映到地圖
+  useEffect(() => {
+    if (mapInst.current && searchCircleRef.current) {
+      searchCircleRef.current.setRadius(radius);
+      searchCircleRef.current.setVisible(showCircle);
+      searchCircleRef.current.setMap(showCircle ? mapInst.current : null);
+    }
+  }, [radius, showCircle]);
+
+  // watchPosition（追蹤位置）
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+
+    if (followMe) {
+      if (watchIdRef.current === null) {
+        watchIdRef.current = navigator.geolocation.watchPosition(
+          (pos) => {
+            const userPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+            if (!userMarkerRef.current) {
+              userMarkerRef.current = new google.maps.Marker({
+                position: userPos,
+                map: mapInst.current!,
+                icon: userBluePinIcon(),
+                title: '目前位置',
+                zIndex: 9999,
+              });
+            } else {
+              userMarkerRef.current.setPosition(userPos);
+            }
+            if (mapInst.current) {
+              mapInst.current.setCenter(userPos);
+              if (showCircle) drawSearchCircle(mapInst.current.getCenter()!);
+            }
+          },
+          () => {},
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 }
+        );
+      }
+    } else if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+
+    return () => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+    };
+  }, [followMe, showCircle]);
+
+  // 判斷自訂中心是否啟用（marker 存在且在地圖上）
+  function isCustomCenterActive() {
+    const mk = customCenterMarkerRef.current;
+    return !!(mk && mk.getMap());
+  }
+
+  function recenterToMe() {
+    if (!mapInst.current || !userMarkerRef.current) return;
+    const pos = userMarkerRef.current.getPosition();
+    if (!pos) return;
+    mapInst.current.setCenter(pos);
+    mapInst.current.setZoom(15);
+    if (showCircle) drawSearchCircle(pos);
+    // 讓後續搜尋用目前地圖中心（關閉自訂中心）
+    clearCustomCenter();
+  }
+
+  // 共用 InfoWindow 取用（若未建立則建立一次）
+  function getSharedInfoWindow() {
+    if (!sharedInfoWindowRef.current) sharedInfoWindowRef.current = new google.maps.InfoWindow();
+    return sharedInfoWindowRef.current;
+  }
+
+  // 產生 InfoWindow HTML（純單引號字串，避免反引號問題），營業時間使用小區塊可捲動
+  function renderPlaceHtml(
+    base: { name: string; vicinity?: string; rating?: number; user_ratings_total?: number },
+    details?: any
+  ) {
+    const parts: string[] = [];
+    parts.push('<div style="max-width:260px">');
+    parts.push('<div style="font-weight:600;margin-bottom:4px">' + escapeHtml(base.name) + '</div>');
+    if (base.vicinity) parts.push('<div style="font-size:12px;color:#475569">' + escapeHtml(base.vicinity) + '</div>');
+    if (typeof base.rating === 'number') {
+      parts.push('<div style="font-size:12px;margin-top:2px">評分：' + base.rating + '（' + (base.user_ratings_total || 0) + '）</div>');
+    }
+    if (details) {
+      if (details.formatted_address) parts.push('<div style="font-size:12px;margin-top:6px">地址：' + escapeHtml(details.formatted_address) + '</div>');
+      if (details.formatted_phone_number) parts.push('<div style="font-size:12px">電話：' + escapeHtml(details.formatted_phone_number) + '</div>');
+      if (details.website) parts.push('<div style="font-size:12px"><a href="' + details.website + '" target="_blank" rel="noopener noreferrer">官方網站</a></div>');
+      if (details.opening_hours?.weekday_text) {
+        const ohAll = (details.opening_hours.weekday_text as string[]).join('<br/>');
+        parts.push('<div style="font-size:12px;margin-top:6px">營業時間：</div>');
+        parts.push(
+          '<div style="font-size:12px;line-height:1.35;max-height:60px;overflow:auto;' +
+            'margin-top:2px;padding:6px 8px;border:1px solid #e5e7eb;border-radius:6px;background:#f8fafc;">' +
+            ohAll +
+          '</div>'
+        );
+      }
+    }
+    parts.push('</div>');
+    return parts.join('');
+  }
+
+  function escapeHtml(s: string) {
+    return s.replace(/[&<>\"']/g, (c) =>
+      ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      } as Record<string, string>)[c]!
+    );
+  }
+
+  async function openPlaceInfo(marker: google.maps.Marker, base: any) {
+    const iw = getSharedInfoWindow();
+    iw.setContent('<div style="padding:4px 2px">載入中…</div>');
+    iw.open({ anchor: marker, map: mapInst.current! });
+
+    try {
+      if (!base.place_id) {
+        iw.setContent(renderPlaceHtml(base));
+        return;
+      }
+      const r = await fetch('/api/places/details?place_id=' + encodeURIComponent(base.place_id));
+      const data = await r.json();
+      if (data.error) {
+        iw.setContent(renderPlaceHtml(base));
+        return;
+      }
+      iw.setContent(renderPlaceHtml(base, data));
+    } catch {
+      iw.setContent(renderPlaceHtml(base));
+    }
+  }
+
+  // ---------- Custom Search Center (coords/address/POI + pick on map) ----------
+
+  async function geocodeAddress(query: string): Promise<google.maps.LatLngLiteral | null> {
+    if (!query) return null;
+    const geocoder = new google.maps.Geocoder();
+
+    // 用目前地圖中心做偏好範圍（非限制，僅排序偏好）
+    let bounds: google.maps.LatLngBounds | undefined;
+    if (mapInst.current) {
+      const c = mapInst.current.getCenter()!;
+      const d = 0.3; // 約 30~40km 的方框
+      bounds = new google.maps.LatLngBounds(
+        new google.maps.LatLng(c.lat() - d, c.lng() - d),
+        new google.maps.LatLng(c.lat() + d, c.lng() + d)
+      );
+    }
+
+    const res = await geocoder.geocode({ address: query, bounds /*, region: 'tw'*/ });
+    const r = res.results?.[0];
+    if (!r) return null;
+    const loc = r.geometry.location;
+    return { lat: loc.lat(), lng: loc.lng() };
+  }
+
+  function setCustomCenter(pos: google.maps.LatLngLiteral) {
+    if (!mapInst.current) return;
+    if (!customCenterMarkerRef.current) {
+      customCenterMarkerRef.current = new google.maps.Marker({
+        position: pos,
+        map: mapInst.current!,
+        title: '自訂搜尋中心',
+        icon: {
+          url: 'https://maps.gstatic.com/mapfiles/ms2/micons/blue-dot.png',
+          scaledSize: new google.maps.Size(32, 32),
+          anchor: new google.maps.Point(16, 16),
+        },
+        zIndex: 9998,
+      });
+    } else {
+      customCenterMarkerRef.current.setPosition(pos);
+      customCenterMarkerRef.current.setMap(mapInst.current!);
+    }
+    mapInst.current.setCenter(pos);
+    mapInst.current.setZoom(Math.max(mapInst.current.getZoom() || 13, 13));
+    drawSearchCircle(new google.maps.LatLng(pos));
+  }
+
+  function clearCustomCenter() {
+    if (customCenterMarkerRef.current) {
+      customCenterMarkerRef.current.setMap(null);
+    }
+  }
+
+  function enablePickOnMap(enable: boolean) {
+    setPickOnMap(enable);
+    mapClickListenerRef.current?.remove();
+    mapClickListenerRef.current = null;
+    if (enable && mapInst.current) {
+      mapClickListenerRef.current = mapInst.current.addListener('click', (e: google.maps.MapMouseEvent) => {
+        const ll = e.latLng!;
+        setCenterInput(ll.lat().toFixed(6) + ',' + ll.lng().toFixed(6));
+        setCustomCenter({ lat: ll.lat(), lng: ll.lng() });
+      });
+    }
+  }
+
+  // ---------------- Nearby search ----------------
+
+  async function searchNearby() {
+    if (!mapInst.current) return;
+    setNearbyLoading(true);
+    try {
+      // 只有自訂中心啟用時才使用，否則用地圖中心
+      const center = isCustomCenterActive()
+        ? customCenterMarkerRef.current!.getPosition()!
+        : mapInst.current!.getCenter()!;
+      if (showCircle) drawSearchCircle(center);
+      const params = new URLSearchParams({ location: center.lat() + ',' + center.lng(), radius: String(radius) });
+      types.forEach((t) => params.append('type', t));
+      if (keyword) params.set('keyword', keyword);
+      const r = await fetch('/api/places/nearby?' + params.toString());
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+
+      // 清除舊的「附近探索」標記（保留 S/E、行程POI、?、自訂中心與圓）
+      nearbyMarkersRef.current.forEach((m) => m.setMap(null));
+      nearbyMarkersRef.current = (data.items as any[])
+        .map((it) => {
+          if (!it.location) return null;
+          const mk = new google.maps.Marker({
+            position: it.location,
+            map: mapInst.current!,
+            title: it.name + ' (' + it._type + ')',
+          });
+          mk.addListener('click', () => openPlaceInfo(mk, it));
+          return mk;
+        })
+        .filter(Boolean) as google.maps.Marker[];
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn(e);
+    } finally {
+      setNearbyLoading(false);
+    }
+  }
+
+  function clearNearbyResults() {
+    nearbyMarkersRef.current.forEach((m) => m.setMap(null));
+    nearbyMarkersRef.current = [];
+    try { sharedInfoWindowRef.current?.close(); } catch {}
+  }
+
+  // ---------------- UI ----------------
+
+  return (
+    <div className="min-h-screen w-full bg-white p-3 lg:p-6">
+      <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-[1fr_420px] gap-6 items-start">
+        <div className="relative w-full aspect-[16/10] rounded-xl shadow overflow-hidden border border-slate-200">
+          <div ref={mapRef} id="map" style={{ width: '100%', height: '60vh', minHeight: 400 }} />
+        </div>
+        <div className="space-y-6">
+          <Panel title="旅行條件">
+            <div className="grid grid-cols-1 gap-3">
+              <div className="flex flex-wrap gap-2">
+                {testCases.map((c, i) => (
+                  <button key={i} onClick={() => applyCase(c)} className="text-xs rounded-lg border px-2 py-1 hover:bg-slate-50">
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+
+              <label className="text-sm font-medium">起點（Origin）</label>
+              <input value={origin} onChange={(e) => setOrigin(e.target.value)} placeholder="台北" className="border rounded-xl px-3 py-2" />
+
+              <label className="text-sm font-medium">終點（Destination）</label>
+              <input value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="墾丁" className="border rounded-xl px-3 py-2" />
+
+              <label className="text-sm font-medium">天數（Days）</label>
+              <input
+                type="number"
+                min={1}
+                max={14}
+                value={days}
+                onChange={(e) => setDays(parseInt(e.target.value || '1', 10))}
+                className="border rounded-xl px-3 py-2 w-28"
+              />
+
+              <div className="flex gap-2 flex-wrap">
+                <button
+                  onClick={planTrip}
+                  className="mt-1 inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800"
+                >
+                  {loading ? '規劃中…' : '規劃行程'}
+                </button>
+                <button onClick={recenterToMe} className="inline-flex items-center justify-center rounded-xl px-3 py-2 border" title="定位到目前位置">
+                  定位到我
+                </button>
+              </div>
+
+              {error && <div className="text-red-600 text-sm whitespace-pre-wrap">{error}</div>}
+              <div className="text-xs text-slate-500">{gmapsReady ? 'Google Maps 模式（已讀到金鑰）。' : '尚未讀到 Google Maps，請確認 NEXT_PUBLIC_GOOGLE_MAPS_API_KEY。'}</div>
+            </div>
+          </Panel>
+
+          <Panel title="路線摘要">
+            {routeInfo ? (
+              <div className="text-sm leading-6">
+                <div>起點：{routeInfo.start}</div>
+                <div>終點：{routeInfo.end}</div>
+                <div>
+                  總距離：{routeInfo.distance} ・ 估計時間：{routeInfo.duration}
+                </div>
+              </div>
+            ) : (
+              <div className="text-sm text-slate-500">請先輸入條件並按「規劃行程」。</div>
+            )}
+          </Panel>
+
+          <Panel title="附近探索（POI）">
+            <div className="grid gap-3 text-sm">
+              <div className="flex flex-wrap gap-2">
+                {[
+                  { k: 'tourist_attraction', t: '景點' },
+                  { k: 'lodging', t: '住宿' },
+                  { k: 'restaurant', t: '餐廳' },
+                  { k: 'cafe', t: '咖啡' },
+                  { k: 'gas_station', t: '加油站' },
+                ].map((opt) => (
+                  <label key={opt.k} className="inline-flex items-center gap-2 border rounded-full px-3 py-1">
+                    <input
+                      type="checkbox"
+                      checked={types.includes(opt.k)}
+                      onChange={(e) => setTypes((prev) => (e.target.checked ? [...prev, opt.k] : prev.filter((x) => x !== opt.k)))}
+                    />
+                    {opt.t}
+                  </label>
+                ))}
+              </div>
+
+              <div>
+                <label className="text-xs text-slate-600">半徑（公尺）</label>
+                <input
+                  type="number"
+                  min={200}
+                  max={5000}
+                  value={radiusInput}
+                  onChange={(e) => {
+                    setRadiusInput(e.target.value); // 允許清空
+                  }}
+                  onBlur={() => {
+                    const n = parseInt(radiusInput, 10);
+                    if (isNaN(n)) {
+                      setRadiusInput(String(radius)); // 還原
+                      return;
+                    }
+                    const clamped = Math.max(200, Math.min(5000, n));
+                    setRadius(clamped);
+                    setRadiusInput(String(clamped));
+                  }}
+                  className="border rounded-xl px-3 py-2 w-32 ml-2"
+                />
+              </div>
+
+              {/* 自訂搜尋中心 */}
+              <div className="space-y-2">
+                <label className="text-xs text-slate-600">自訂搜尋中心（輸入座標「lat,lng」或景點/地址）</label>
+                <div className="flex gap-2">
+                  <input
+                    ref={centerInputRef}
+                    value={centerInput}
+                    onChange={(e) => setCenterInput(e.target.value)}
+                    placeholder="例：25.033964,121.564468 或 台北101 / 台北車站"
+                    className="border rounded-xl px-3 py-2 flex-1"
+                  />
+                  <button
+                    type="button"
+                    className="border rounded-xl px-3 py-2"
+                    onClick={async () => {
+                      if (!mapInst.current) return;
+                      const ll = parseLatLng(centerInput) || await geocodeAddress(centerInput);
+                      if (!ll) {
+                        alert('無法解析位置，請輸入「lat,lng」或有效的景點/地址');
+                        return;
+                      }
+                      setCustomCenter(ll);
+                    }}
+                  >
+                    設為中心
+                  </button>
+                  <button
+                    type="button"
+                    className={`rounded-xl px-3 py-2 ${pickOnMap ? 'bg-slate-900 text-white' : 'border'}`}
+                    onClick={() => enablePickOnMap(!pickOnMap)}
+                    title="在地圖上點一下設定搜尋中心"
+                  >
+                    {pickOnMap ? '點選中…' : '用地圖選點'}
+                  </button>
+                  <button type="button" className="border rounded-xl px-3 py-2" onClick={() => { clearCustomCenter(); }}>
+                    清除中心
+                  </button>
+                </div>
+                <div className="text-xs text-slate-500">
+                  目前中心：{
+                    customCenterMarkerRef.current?.getPosition()
+                      ? `${customCenterMarkerRef.current.getPosition()!.lat().toFixed(6)}, ${customCenterMarkerRef.current.getPosition()!.lng().toFixed(6)}`
+                      : '使用地圖中心'
+                  }
+                </div>
+              </div>
+
+              <div className="flex items-center gap-4">
+                <label className="inline-flex items-center gap-2">
+                  <input type="checkbox" checked={showCircle} onChange={(e) => setShowCircle(e.target.checked)} />
+                  顯示搜尋範圍圓
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input type="checkbox" checked={autoUpdateOnDrag} onChange={(e) => setAutoUpdateOnDrag(e.target.checked)} />
+                  拖曳地圖時更新圓
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input type="checkbox" checked={followMe} onChange={(e) => setFollowMe(e.target.checked)} />
+                  追蹤我的位置
+                </label>
+              </div>
+
+              <input value={keyword} onChange={(e) => setKeyword(e.target.value)} placeholder="ramen / coffee / museum ..." className="border rounded-xl px-3 py-2" />
+
+              <div className="flex gap-2">
+                <button
+                  onClick={searchNearby}
+                  className="inline-flex items-center justify-center rounded-xl px-4 py-2 font-semibold shadow-sm bg-slate-900 text-white hover:bg-slate-800"
+                >
+                  {nearbyLoading ? '搜尋中…' : '搜尋附近'}
+                </button>
+                <button
+                  onClick={clearNearbyResults}
+                  className="inline-flex items-center justify-center rounded-xl px-4 py-2 border hover:bg-slate-50"
+                  title="清除附近探索的紅色標記"
+                >
+                  清除搜尋結果
+                </button>
+              </div>
+            </div>
+          </Panel>
+
+          <Panel title="每日行程">
+            {plan.length === 0 ? (
+              <div className="text-sm text-slate-500">尚無行程。</div>
+            ) : (
+              <div className="space-y-4">
+                {plan.map((day, dayIdx) => {
+                  // 本日第一個距離起算點：第一天用整體起點，其他天用前一天最後一個景點（若無則用整體起點）
+                  const prevDayLast =
+                    dayIdx > 0 && plan[dayIdx - 1].pois.length > 0
+                      ? plan[dayIdx - 1].pois[plan[dayIdx - 1].pois.length - 1]
+                      : null;
+                  const firstAnchor =
+                    dayIdx === 0 || !prevDayLast
+                      ? routeStartRef.current
+                      : { lat: prevDayLast.lat, lng: prevDayLast.lng };
+
+                  let dailyTotalKm = 0;
+
+                  return (
+                  <div key={day.day} className="border rounded-xl p-3">
+                    <div className="font-semibold">
+                      第 {day.day} 天 · {destination}
+                    </div>
+                    <ol className="list-decimal ml-5 mt-1 space-y-1">
+                        {day.pois.map((p, i) => {
+                          // 第 1 景點：起算點 → 第 1 景點；其餘：上一景點 → 本景點
+                          const anchor =
+                            i === 0
+                              ? firstAnchor
+                              : { lat: day.pois[i - 1].lat, lng: day.pois[i - 1].lng };
+
+                          let legKm = 0;
+                          if (anchor) legKm = haversineKm(anchor, { lat: p.lat, lng: p.lng });
+                          dailyTotalKm += legKm;
+
+                          return (
+                        <li key={i}>
+                              <div className="font-medium flex items-center gap-2">
+                                <span>{p.name}</span>
+                                {p._type && (
+                                  <span className={`text-[10px] px-2 py-0.5 rounded-full border ${typeBadgeClass(p._type)}`}>
+                                    {typeLabel(p._type)}
+                                  </span>
+                                )}
+                              </div>
+                          {p.address && <div className="text-xs text-slate-600">{p.address}</div>}
+                              {anchor && (
+                                <div className="text-xs text-slate-500">
+                                  距上個點：{fmtDistance(legKm)}
+                                </div>
+                              )}
+                        </li>
+                          );
+                        })}
+                    </ol>
+
+                      {day.pois.length > 0 && (
+                        <div className="text-xs text-slate-500 mt-2">
+                          本日景點間直線距離合計：約 {fmtDistance(dailyTotalKm)}
+                        </div>
+                      )}
+                  </div>
+                  );
+                })}
+              </div>
+            )}
+          </Panel>
+        </div>
+      </div>
+    </div>
+  );
 }

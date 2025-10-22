@@ -11,11 +11,18 @@ type POI = {
   name: string;
   lat: number;
   lng: number;
-  address?: string;
+  address?: string; // 後端已盡量前置 city（如：台北市 信義區 · ...）
   rating?: number;
   _type?: 'tourist_attraction' | 'restaurant' | 'lodging';
+  city?: string;    // 以防萬一，前端可輔助前置
 };
-type DayPlan = { day: number; city: string; pois: POI[] };
+
+type ItineraryDay = {
+  morning: POI[];    // 1–2 景點
+  lunch?: POI;       // 餐廳 1
+  afternoon: POI[];  // 1–2 景點
+  lodging?: POI;     // 住宿 1
+};
 
 type PlanResponse = {
   provider: 'google' | 'osrm';
@@ -24,7 +31,8 @@ type PlanResponse = {
   end: { lat: number; lng: number; address: string };
   distanceText: string;
   durationText: string;
-  pois: POI[];
+  pois: POI[];           // 兼容舊欄位（用來畫點）
+  itinerary: ItineraryDay[]; // ★ 新欄位：旅行社式日程
 };
 
 // ---------------- UI ----------------
@@ -143,6 +151,16 @@ function typeBadgeClass(t?: string) {
   return 'bg-slate-50 text-slate-700 border-slate-200';
 }
 
+// 顯示地址（若後端未前置 city，前端輔助前置）
+function displayAddress(p: POI) {
+  if (!p.address && !p.city) return '';
+  if (!p.address) return p.city!;
+  if (!p.city) return p.address;
+  // 已前置就不再重複
+  if (p.address.startsWith(p.city)) return p.address;
+  return `${p.city} · ${p.address}`;
+}
+
 // ---------------- Component ----------------
 
 export default function WidgetClient() {
@@ -181,7 +199,9 @@ export default function WidgetClient() {
     start: string;
     end: string;
   } | null>(null);
-  const [plan, setPlan] = useState<DayPlan[]>([]);
+
+  // ★ 取代 DayPlan：用後端產生的旅行社行程
+  const [itinerary, setItinerary] = useState<ItineraryDay[]>([]);
 
   // Nearby controls
   const [types, setTypes] = useState<string[]>(['tourist_attraction', 'restaurant']);
@@ -303,7 +323,7 @@ export default function WidgetClient() {
     if (!gmapsReady || !mapInst.current) return;
     setLoading(true);
     setError('');
-    setPlan([]);
+    setItinerary([]);
     setRouteInfo(null);
 
     try {
@@ -317,7 +337,7 @@ export default function WidgetClient() {
 
       const g = google.maps;
 
-      // 清除舊路線（保留?、圓、行程POI、自訂中心與 Nearby 標記）
+      // 清除舊路線（保留圓、自訂中心與 Nearby 標記）
       if (routePolylineRef.current) {
         routePolylineRef.current.setMap(null);
         routePolylineRef.current = null;
@@ -346,25 +366,17 @@ export default function WidgetClient() {
       polyPath.forEach((p) => bounds.extend(p));
       mapInst.current!.fitBounds(bounds);
 
-      // 顯示行程 POIs（取前 25）——獨立於 Nearby
+      // 顯示部分 POIs（視需要）
       poiMarkersRef.current.forEach((m) => m.setMap(null));
-      poiMarkersRef.current = data.pois
-        .slice(0, 25)
-        .map((p) => new g.Marker({ position: { lat: p.lat, lng: p.lng }, title: p.name, map: mapInst.current! }));
+      poiMarkersRef.current = data.pois.slice(0, 25).map((p) =>
+        new g.Marker({ position: { lat: p.lat, lng: p.lng }, title: p.name, map: mapInst.current! })
+      );
 
       setRouteInfo({ distance: data.distanceText, duration: data.durationText, start: data.start.address, end: data.end.address });
-
-      // 記住整體起點座標（供距離計算）
       routeStartRef.current = { lat: data.start.lat, lng: data.start.lng };
 
-      // 切天
-      const perDay = Math.max(2, Math.min(3, Math.ceil((data.pois.length || 6) / days)));
-      const daysPlan: DayPlan[] = [];
-      for (let d = 0; d < days; d++) {
-        const slice = data.pois.slice(d * perDay, (d + 1) * perDay);
-        daysPlan.push({ day: d + 1, city: destination, pois: slice });
-      }
-      setPlan(daysPlan);
+      // ★ 使用後端算好的旅行社行程
+      setItinerary(data.itinerary || []);
 
       send({ type: 'result', payload: { origin, destination, days } });
     } catch (e: any) {
@@ -483,7 +495,7 @@ export default function WidgetClient() {
     return sharedInfoWindowRef.current;
   }
 
-  // 產生 InfoWindow HTML（純單引號字串，避免反引號問題），營業時間使用小區塊可捲動
+  // 產生 InfoWindow HTML（純單引號字串，避免反引號問題）
   function renderPlaceHtml(
     base: { name: string; vicinity?: string; rating?: number; user_ratings_total?: number },
     details?: any
@@ -632,7 +644,7 @@ export default function WidgetClient() {
       const data = await r.json();
       if (data.error) throw new Error(data.error);
 
-      // 清除舊的「附近探索」標記（保留 S/E、行程POI、?、自訂中心與圓）
+      // 清除舊的「附近探索」標記（保留 S/E、行程POI、自訂中心與圓）
       nearbyMarkersRef.current.forEach((m) => m.setMap(null));
       nearbyMarkersRef.current = (data.items as any[])
         .map((it) => {
@@ -853,43 +865,30 @@ export default function WidgetClient() {
             </div>
           </Panel>
 
+          {/* ★ 新版：旅行社式每日行程（早/午/下午/住宿） */}
           <Panel title="每日行程">
-            {plan.length === 0 ? (
+            {itinerary.length === 0 ? (
               <div className="text-sm text-slate-500">尚無行程。</div>
             ) : (
               <div className="space-y-4">
-                {plan.map((day, dayIdx) => {
-                  // 本日第一個距離起算點：第一天用整體起點，其他天用前一天最後一個景點（若無則用整體起點）
-                  const prevDayLast =
-                    dayIdx > 0 && plan[dayIdx - 1].pois.length > 0
-                      ? plan[dayIdx - 1].pois[plan[dayIdx - 1].pois.length - 1]
-                      : null;
-                  const firstAnchor =
-                    dayIdx === 0 || !prevDayLast
-                      ? routeStartRef.current
-                      : { lat: prevDayLast.lat, lng: prevDayLast.lng };
+                {itinerary.map((day, dayIdx) => {
+                  // 依順序串起來計算直線距離合計：morning[] -> lunch -> afternoon[] -> lodging
+                  const seq: POI[] = [
+                    ...day.morning,
+                    ...(day.lunch ? [day.lunch] : []),
+                    ...day.afternoon,
+                    ...(day.lodging ? [day.lodging] : []),
+                  ];
+                  let dailyKm = 0;
+                  for (let i = 1; i < seq.length; i++) {
+                    dailyKm += haversineKm(
+                      { lat: seq[i - 1].lat, lng: seq[i - 1].lng },
+                      { lat: seq[i].lat, lng: seq[i].lng }
+                    );
+                  }
 
-                  let dailyTotalKm = 0;
-
-                  return (
-                  <div key={day.day} className="border rounded-xl p-3">
-                    <div className="font-semibold">
-                      第 {day.day} 天 · {destination}
-                    </div>
-                    <ol className="list-decimal ml-5 mt-1 space-y-1">
-                        {day.pois.map((p, i) => {
-                          // 第 1 景點：起算點 → 第 1 景點；其餘：上一景點 → 本景點
-                          const anchor =
-                            i === 0
-                              ? firstAnchor
-                              : { lat: day.pois[i - 1].lat, lng: day.pois[i - 1].lng };
-
-                          let legKm = 0;
-                          if (anchor) legKm = haversineKm(anchor, { lat: p.lat, lng: p.lng });
-                          dailyTotalKm += legKm;
-
-                          return (
-                        <li key={i}>
+                  const Item = ({ p }: { p: POI }) => (
+                    <li className="ml-5">
                               <div className="font-medium flex items-center gap-2">
                                 <span>{p.name}</span>
                                 {p._type && (
@@ -898,20 +897,45 @@ export default function WidgetClient() {
                                   </span>
                                 )}
                               </div>
-                          {p.address && <div className="text-xs text-slate-600">{p.address}</div>}
-                              {anchor && (
-                                <div className="text-xs text-slate-500">
-                                  距上個點：{fmtDistance(legKm)}
-                                </div>
+                      {(p.address || p.city) && (
+                        <div className="text-xs text-slate-600">{displayAddress(p)}</div>
                               )}
                         </li>
                           );
-                        })}
-                    </ol>
 
-                      {day.pois.length > 0 && (
+                  return (
+                    <div key={dayIdx} className="border rounded-xl p-3">
+                      <div className="font-semibold">第 {dayIdx + 1} 天</div>
+
+                      <div className="mt-2 space-y-2">
+                        <div>
+                          <div className="text-sm font-semibold">上午</div>
+                          {day.morning.length ? (
+                            <ol className="list-decimal space-y-1">{day.morning.map((p, i) => <Item key={i} p={p} />)}</ol>
+                          ) : <div className="text-xs text-slate-500">（無）</div>}
+                        </div>
+
+                        <div>
+                          <div className="text-sm font-semibold">中午（餐廳）</div>
+                          {day.lunch ? <ul className="list-disc ml-5"><Item p={day.lunch} /></ul> : <div className="text-xs text-slate-500">（無）</div>}
+                        </div>
+
+                        <div>
+                          <div className="text-sm font-semibold">下午</div>
+                          {day.afternoon.length ? (
+                            <ol className="list-decimal space-y-1">{day.afternoon.map((p, i) => <Item key={i} p={p} />)}</ol>
+                          ) : <div className="text-xs text-slate-500">（無）</div>}
+                        </div>
+
+                        <div>
+                          <div className="text-sm font-semibold">晚上（住宿）</div>
+                          {day.lodging ? <ul className="list-disc ml-5"><Item p={day.lodging} /></ul> : <div className="text-xs text-slate-500">（無）</div>}
+                        </div>
+                      </div>
+
+                      {seq.length > 1 && (
                         <div className="text-xs text-slate-500 mt-2">
-                          本日景點間直線距離合計：約 {fmtDistance(dailyTotalKm)}
+                          本日景點間直線距離合計：約 {fmtDistance(dailyKm)}
                         </div>
                       )}
                   </div>

@@ -13,7 +13,7 @@ type PlaceOut = {
   rating?: number;
   place_id?: string;
   _type: PlaceType;
-  city?: string; // 反向地理編碼後加上
+  city?: string; // 反向地理編碼或從地址抽出的縣市
 };
 
 type DaySlot = {
@@ -25,101 +25,114 @@ type DaySlot = {
 
 const LANG = 'zh-TW';
 const TYPES: PlaceType[] = ['tourist_attraction', 'restaurant', 'lodging'];
-const NEAR_EQ_KM = 3; // 起訖小於 3km 視為單點玩法
+const NEAR_EQ_KM = 3;
 
-// ------------------------------------------------------------------
-// Utils
-// ------------------------------------------------------------------
+/* ======================= 通用工具 ======================= */
 function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
 
-async function fetchJson<T = any>(url: string, init?: RequestInit): Promise<T> {
+async function fetchJson<T=any>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, { cache: 'no-store', ...init });
-  if (!r.ok) {
-    let msg = `HTTP ${r.status}`;
-    try { msg += ' ' + (await r.text()).slice(0,200); } catch {}
-    throw new Error(msg);
-  }
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json() as Promise<T>;
 }
 
 function haversineKm(a: LatLng, b: LatLng) {
-  const R = 6371;
-  const dLat = (b.lat - a.lat) * Math.PI / 180;
-  const dLng = (b.lng - a.lng) * Math.PI / 180;
-  const la1 = a.lat * Math.PI / 180, la2 = b.lat * Math.PI / 180;
-  const s1 = Math.sin(dLat / 2), s2 = Math.sin(dLng / 2);
-  return 2 * R * Math.asin(Math.sqrt(s1*s1 + Math.cos(la1)*Math.cos(la2)*s2*s2));
+  const R=6371;
+  const dLat=(b.lat-a.lat)*Math.PI/180, dLng=(b.lng-a.lng)*Math.PI/180;
+  const la1=a.lat*Math.PI/180, la2=b.lat*Math.PI/180;
+  const s1=Math.sin(dLat/2), s2=Math.sin(dLng/2);
+  return 2*R*Math.asin(Math.sqrt(s1*s1+Math.cos(la1)*Math.cos(la2)*s2*s2));
 }
 
 function cumulativeLengthKm(path: LatLng[]) {
-  const acc = [0];
-  for (let i=1;i<path.length;i++) acc.push(acc[i-1] + haversineKm(path[i-1], path[i]));
+  const acc=[0];
+  for (let i=1;i<path.length;i++) acc.push(acc[i-1]+haversineKm(path[i-1],path[i]));
   return acc;
 }
 
-/** 動態沿線採樣：總距離越長，點數越多，但有上下限 */
+/** 動態沿線採樣（略增密度） */
 function sampleAlongPathDynamic(path: LatLng[]) {
   if (!path.length) return [];
-  const cum = cumulativeLengthKm(path), total = cum[cum.length-1];
-  if (total === 0) return [path[0]];
-  const step = Math.max(20, Math.min(50, total/15));      // 每 ~20–50km 取一個
-  const n    = Math.min(24, Math.max(2, Math.round(total/step)+1)); // 最多 24 個點
-  const out: LatLng[] = [];
+  const cum=cumulativeLengthKm(path), total=cum[cum.length-1];
+  if (total===0) return [path[0]];
+  const step=Math.max(15, Math.min(40, total/18)); // 更密一些
+  const n=Math.min(36, Math.max(3, Math.round(total/step)+1));
+  const out:LatLng[]=[];
   for (let i=0;i<n;i++){
-    const target = (i/(n-1))*total;
-    let j=0; while (j<cum.length && cum[j]<target) j++;
+    const target=(i/(n-1))*total;
+    let j=0; while(j<cum.length && cum[j]<target) j++;
     if (j===0) out.push(path[0]);
     else if (j>=cum.length) out.push(path[path.length-1]);
     else {
       const t0=cum[j-1], t1=cum[j], A=path[j-1], B=path[j];
       const r=t1===t0?0:(target-t0)/(t1-t0);
-      out.push({ lat: A.lat+(B.lat-A.lat)*r, lng: A.lng+(B.lng-A.lng)*r });
+      out.push({ lat:A.lat+(B.lat-A.lat)*r, lng:A.lng+(B.lng-A.lng)*r });
     }
   }
-  // 去重（<5km 視為同點）
-  const dedup: LatLng[] = [];
-  for (const p of out) if (!dedup.some(q=>haversineKm(p,q)<5)) dedup.push(p);
+  // 去重（<5km）
+  const dedup:LatLng[]=[];
+  for (const p of out) if(!dedup.some(q=>haversineKm(p,q)<5)) dedup.push(p);
   return dedup;
 }
 
+/** 半徑放大（避免只搜到台北） */
 function dynamicRadiusMeters(totalKm:number){
-  // 依總里程動態設定沿途搜尋半徑（5–15km）
-  return Math.min(15000, Math.max(5000, Math.round(totalKm * 20)));
+  // 8–25km，長程提高覆蓋
+  return Math.min(25000, Math.max(8000, Math.round(totalKm*30)));
 }
 
-// ------------------------------------------------------------------
-// Google APIs
-// ------------------------------------------------------------------
+/** 從中文地址抽出「縣/市 + 區」 */
+function extractCityFromAddress(addr?: string): string|undefined {
+  if (!addr) return;
+  // 常見格式：台北市 信義區 / 新北市 新店區 / 桃園市 中壢區 / xx縣 xx鄉/鎮/市/區
+  const m = addr.match(/((?:台北|臺北|新北|桃園|台中|臺中|台南|臺南|高雄|基隆|新竹|嘉義)[市]|[^\s·,，。]{1,6}[縣])\s*([^\s·,，。]{1,6}(?:區|鄉|鎮|市))/);
+  if (m) return `${m[1]} ${m[2]}`;
+  // 後備：抓到「…市/縣 …區」任意兩段
+  const m2 = addr.match(/([^\s·,，。]{1,6}[市縣])\s*([^\s·,，。]{1,6}(?:區|鄉|鎮|市))/);
+  if (m2) return `${m2[1]} ${m2[2]}`;
+}
+
+/** 保證把 city 前置到 address */
+function ensureCityPrefixed(p: PlaceOut) {
+  const city = p.city || extractCityFromAddress(p.address);
+  if (!city) return;
+  p.city = city;
+  if (!p.address) { p.address = city; return; }
+  if (!p.address.startsWith(city)) p.address = `${city} · ${p.address}`;
+}
+
+/* ======================= Google APIs ======================= */
 async function geocodeGoogle(query: string): Promise<LatLng & { formatted: string }> {
-  const key = process.env.GOOGLE_MAPS_API_KEY!;
-  const base = 'https://maps.googleapis.com/maps/api/geocode/json';
-  let j = await fetchJson<any>(`${base}?address=${encodeURIComponent(query)}&language=${LANG}&region=tw&key=${key}`);
-  if (!j.results?.[0]) j = await fetchJson<any>(`${base}?address=${encodeURIComponent(query)}&language=${LANG}&key=${key}`);
+  const key=process.env.GOOGLE_MAPS_API_KEY!;
+  const base='https://maps.googleapis.com/maps/api/geocode/json';
+  let j=await fetchJson<any>(`${base}?address=${encodeURIComponent(query)}&language=${LANG}&region=tw&key=${key}`);
+  if (!j.results?.[0]) j=await fetchJson<any>(`${base}?address=${encodeURIComponent(query)}&language=${LANG}&key=${key}`);
   if (!j.results?.[0]) throw new Error(j.error_message || 'geocode_failed');
   const g=j.results[0];
   return { lat:g.geometry.location.lat, lng:g.geometry.location.lng, formatted:g.formatted_address };
 }
 
 async function reverseCity(lat:number,lng:number): Promise<string|undefined> {
-  const key = process.env.GOOGLE_MAPS_API_KEY!;
-  const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&language=${LANG}&key=${key}`;
-  const j = await fetchJson<any>(url);
+  try{
+    const key=process.env.GOOGLE_MAPS_API_KEY!;
+    const url=`https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&language=${LANG}&key=${key}`;
+    const j=await fetchJson<any>(url);
   const ac: any[] = j.results?.[0]?.address_components || [];
   const find = (t:string)=>ac.find(c=>c.types?.includes(t))?.long_name;
-  // 以 台灣常見為主：縣市 + 行政區
-  const lvl2 = find('administrative_area_level_2') || find('locality'); // 縣市
-  const sub  = find('sublocality_level_1') || find('political');        // 區
-  const parts = [lvl2, sub].filter(Boolean);
+    const lvl2=find('administrative_area_level_2') || find('locality');
+    const sub =find('sublocality_level_1') || find('political');
+    const parts=[lvl2, sub].filter(Boolean);
   return parts.length ? parts.join(' ') : (lvl2 || undefined);
+  }catch{ return undefined; }
 }
 
 async function routeGoogle(origin:string, destination:string){
-  const key = process.env.GOOGLE_MAPS_API_KEY!;
-  const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&language=${LANG}&region=tw&mode=driving&key=${key}`;
-  const j   = await fetchJson<any>(url);
+  const key=process.env.GOOGLE_MAPS_API_KEY!;
+  const url=`https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&language=${LANG}&region=tw&mode=driving&key=${key}`;
+  const j=await fetchJson<any>(url);
   if (j.status!=='OK' || !j.routes?.[0]) throw new Error(j.error_message||j.status||'directions_failed');
   const route=j.routes[0], leg=route.legs[0];
-  const coords = polyline.decode(route.overview_polyline.points).map(([lat,lng]:[number,number])=>({lat,lng}));
+  const coords=polyline.decode(route.overview_polyline.points).map(([lat,lng]:[number,number])=>({lat,lng}));
   return {
     polyline: coords as LatLng[],
     start: { lat: leg.start_location.lat, lng: leg.start_location.lng, address: leg.start_address },
@@ -129,97 +142,98 @@ async function routeGoogle(origin:string, destination:string){
 }
 
 async function nearby(center:LatLng, type:PlaceType, radiusM:number) {
-  const key = process.env.GOOGLE_MAPS_API_KEY!;
-  const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${center.lat},${center.lng}&radius=${radiusM}&type=${encodeURIComponent(type)}&language=${LANG}&key=${key}`;
-  const j = await fetchJson<any>(url);
+  const key=process.env.GOOGLE_MAPS_API_KEY!;
+  const url=`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${center.lat},${center.lng}&radius=${radiusM}&type=${encodeURIComponent(type)}&language=${LANG}&key=${key}`;
+  const j=await fetchJson<any>(url);
   if (j.status && j.status!=='OK' && j.status!=='ZERO_RESULTS') return [];
   return Array.isArray(j.results)? j.results : [];
 }
 
 function scorePlace(p:any, distKm?:number) {
-  // 綜合評分（評分 * 人氣 * 鄰近性）
-      const rating = p.rating || 0;
-      const urt = p.user_ratings_total || 1;
-  const pop = Math.log10(urt + 1) + 1;     // 1 ~ 3+ 關注度
-  const prox = typeof distKm==='number' ? 1/(1 + distKm/5) : 1;
-  return rating * pop * prox;
+  const rating=p.rating||0, urt=p.user_ratings_total||1;
+  const pop=Math.log10(urt+1)+1;
+  const prox= typeof distKm==='number' ? 1/(1+distKm/5) : 1;
+  return rating*pop*prox;
 }
 
-/** 計算沿線進度：用最近折線頂點索引近似 */
 function progressIndex(path:LatLng[], pt:LatLng): number {
   let best=Infinity, bi=0;
   for (let i=0;i<path.length;i++){
-    const d = haversineKm(pt, path[i]);
+    const d=haversineKm(pt, path[i]);
     if (d<best){ best=d; bi=i; }
   }
   return bi;
 }
 
-/** 沿途搜尋 + 依「沿路前進進度」排序（關鍵：避免同日來回） */
 async function placesAlongRoute(path:LatLng[]): Promise<Array<PlaceOut & {__prog:number}>> {
-  const samples = sampleAlongPathDynamic(path);
-  const totalKm = haversineKm(path[0], path[path.length-1]);
-  const radius  = dynamicRadiusMeters(totalKm);
-  const byId    = new Map<string,{item:PlaceOut & {__prog:number},score:number}>();
+  const samples=sampleAlongPathDynamic(path);
+  const totalKm=haversineKm(path[0], path[path.length-1]);
+  const radius=dynamicRadiusMeters(totalKm);
+  const byId=new Map<string,{item:PlaceOut & {__prog:number},score:number}>();
 
   for (const s of samples){
     for (const t of TYPES){
-      const arr = await nearby(s, t, radius);
+      const arr=await nearby(s, t, radius);
       for (const p of arr){
-        const id = p.place_id as string|undefined; if (!id) continue;
-        const loc:LatLng = { lat:p.geometry.location.lat, lng:p.geometry.location.lng };
-        const dist = haversineKm(s, loc);
-        const sc   = scorePlace(p, dist);
+        const id=p.place_id as string|undefined; if (!id) continue;
+        const loc:LatLng={ lat:p.geometry.location.lat, lng:p.geometry.location.lng };
+        const dist=haversineKm(s, loc);
+        const sc=scorePlace(p, dist);
         const item:PlaceOut & {__prog:number} = {
-      name: p.name,
-          lat: loc.lat, lng: loc.lng,
-      address: p.vicinity || p.formatted_address,
-    rating: p.rating,
-          place_id: id,
-          _type: t,
+          name:p.name, lat:loc.lat, lng:loc.lng,
+          address:p.vicinity||p.formatted_address,
+          rating:p.rating, place_id:id, _type:t,
           __prog: progressIndex(path, loc),
         };
-
-        const cur = byId.get(id);
-        if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
+        const cur=byId.get(id);
+        if (!cur || sc>cur.score) byId.set(id,{item,score:sc});
       }
-      await sleep(80); // 拖一下避免 QPS 過高
+      await sleep(60);
     }
   }
 
-  // 先按沿路進度排，若同進度再看評分
   return Array.from(byId.values())
     .map(x=>x.item)
     .sort((a,b)=> a.__prog - b.__prog || (b.rating??0)-(a.rating??0));
 }
 
-/** 旅行社式排程：依進度等分，上午/午餐/下午/住宿 */
-function buildAgencyStyleItineraryByProgress(sorted: Array<PlaceOut & {__prog:number}>, days:number): DaySlot[] {
+/* ============ 旅行社式分配（平均切片，保證每天有點） ============ */
+function buildAgencyStyleItinerary(sorted: Array<PlaceOut & {__prog:number}>, days:number): DaySlot[] {
   const itinerary:DaySlot[] = Array.from({length:days}, ()=>({ morning:[], afternoon:[] }));
   if (sorted.length===0) return itinerary;
 
-  const progMin = sorted[0].__prog, progMax = sorted[sorted.length-1].__prog;
-  const step = Math.max(1, Math.floor((progMax - progMin + 1)/days));
-
-  // 只拿景點作骨架
   const attractions = sorted.filter(p=>p._type==='tourist_attraction');
+  const restaurants = sorted.filter(p=>p._type==='restaurant');
+  const lodgings   = sorted.filter(p=>p._type==='lodging');
 
+  // 1) 依進度排序後，平均切片（避免後段空白）
+  const perDay = Math.max(2, Math.ceil(attractions.length / days)); // 目標每日至少 2 景點（若不足會少於 2）
+  let idx = 0;
   for (let d=0; d<days; d++){
-    const segStart = progMin + d*step;
-    const segEnd   = d===days-1 ? progMax+1 : segStart + step;
-    const inSeg    = attractions.filter(p=>p.__prog>=segStart && p.__prog<segEnd);
-
-    const morning   = inSeg.slice(0, Math.min(2, inSeg.length));
-    const afternoon = inSeg.slice(morning.length, Math.min(morning.length+2, inSeg.length));
+    const seg = attractions.slice(idx, idx + perDay);
+    idx += perDay;
+    const morning = seg.slice(0, Math.min(2, seg.length));
+    const afternoon = seg.slice(morning.length, Math.min(morning.length+2, seg.length));
     itinerary[d].morning   = morning;
     itinerary[d].afternoon = afternoon;
   }
 
-  // 午餐：靠近當日幾何中心的高分餐廳
-  const restaurants = sorted.filter(p=>p._type==='restaurant');
+  // 若最後幾天仍然空，從前面天數把剩餘 attraction 依序撥補
+  const flatUsed = new Set(itinerary.flatMap(s=>[...s.morning,...s.afternoon]).map(p=>p.place_id));
+  const leftovers = attractions.filter(p=>!flatUsed.has(p.place_id||'__NA__'));
+  for (let d=0; d<days && leftovers.length>0; d++){
+    const s = itinerary[d];
+    while (s.morning.length + s.afternoon.length < 2 && leftovers.length>0) {
+      const take = leftovers.shift()!;
+      // 放到午後
+      s.afternoon.push(take);
+    }
+  }
+
+  // 2) 午餐：靠近當日幾何中心的高分餐廳
   for (let d=0; d<days; d++){
     const pts=[...itinerary[d].morning, ...itinerary[d].afternoon];
-    if (!pts.length) continue;
+    if (!pts.length || !restaurants.length) continue;
     const cx=pts.reduce((s,p)=>s+p.lat,0)/pts.length;
     const cy=pts.reduce((s,p)=>s+p.lng,0)/pts.length;
     let best:PlaceOut|undefined, bs=-1;
@@ -230,12 +244,11 @@ function buildAgencyStyleItineraryByProgress(sorted: Array<PlaceOut & {__prog:nu
     if (best) itinerary[d].lunch = best;
   }
 
-  // 住宿：靠近下午最後一景點的高分住宿
-  const lodgings = sorted.filter(p=>p._type==='lodging');
+  // 3) 住宿：靠近下午最後一景點的高分住宿
   for (let d=0; d<days; d++){
     const anchor = itinerary[d].afternoon[itinerary[d].afternoon.length-1]
                 || itinerary[d].morning[itinerary[d].morning.length-1];
-    if (!anchor) continue;
+    if (!anchor || !lodgings.length) continue;
     let best:PlaceOut|undefined, bs=-1;
     for (const h of lodgings){
       const sc = (h.rating||0) / (1 + haversineKm({lat:anchor.lat,lng:anchor.lng}, {lat:h.lat,lng:h.lng})/5);
@@ -247,29 +260,25 @@ function buildAgencyStyleItineraryByProgress(sorted: Array<PlaceOut & {__prog:nu
   return itinerary;
 }
 
-// ------------------------------------------------------------------
-// OSM/OSRM fallback（無 Google Key 時使用）
-// ------------------------------------------------------------------
+/* ======================= OSM/OSRM 後備 ======================= */
 async function geocodeOSM(query: string) {
   const url=`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`;
-  const r = await fetch(url,{ headers:{'Accept-Language':LANG}, cache:'no-store'});
-  const j = await r.json();
+  const r=await fetch(url,{ headers:{'Accept-Language':LANG}, cache:'no-store'});
+  const j=await r.json();
   if (!Array.isArray(j)||!j[0]) throw new Error('geocode_failed');
   return { lat: parseFloat(j[0].lat), lng: parseFloat(j[0].lon), formatted: j[0].display_name };
 }
 
 async function routeOSRM(origin:LatLng, dest:LatLng){
   const url=`https://router.project-osrm.org/route/v1/driving/${origin.lng},${origin.lat};${dest.lng},${dest.lat}?overview=full&geometries=geojson`;
-  const j = await fetchJson<any>(url);
+  const j=await fetchJson<any>(url);
   if (!j.routes?.[0]) throw new Error('route_failed');
   const route=j.routes[0];
   const coords=route.geometry.coordinates.map(([lng,lat]:[number,number])=>({lat,lng}));
   return { polyline: coords as LatLng[], distanceText:(route.distance/1000).toFixed(1)+' km', durationText: Math.round(route.duration/60)+' 分鐘' };
 }
 
-// ------------------------------------------------------------------
-// Route Handler
-// ------------------------------------------------------------------
+/* ======================= Route Handler ======================= */
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(()=> ({}));
@@ -286,41 +295,35 @@ export async function POST(req: NextRequest) {
       const startLL={lat:r.start.lat,lng:r.start.lng}, endLL={lat:r.end.lat,lng:r.end.lng};
       const isSingle = haversineKm(startLL,endLL) <= NEAR_EQ_KM;
 
-      // 2) 蒐集候選點（單點 or 沿途）
-      let poisRaw: Array<PlaceOut & {__prog:number}> = [];
-
+      // 2) 取得候選點
+      let candidates: Array<PlaceOut & {__prog:number}> = [];
       if (isSingle) {
-        // 單點玩法：以起點 3km radius 搜尋三類型，按評分/人氣排序
         const key=process.env.GOOGLE_MAPS_API_KEY!;
-        const arr: Array<PlaceOut & {__prog:number}> = [];
         for (const t of TYPES){
-          const url=`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${startLL.lat},${startLL.lng}&radius=3000&type=${t}&language=${LANG}&key=${key}`;
+          const url=`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${startLL.lat},${startLL.lng}&radius=5000&type=${t}&language=${LANG}&key=${key}`;
           const j=await fetchJson<any>(url);
           const res = Array.isArray(j.results)? j.results : [];
           for (const p of res){
             const id=p.place_id as string|undefined; if (!id) continue;
-            arr.push({
+            candidates.push({
               name:p.name, lat:p.geometry.location.lat, lng:p.geometry.location.lng,
               address:p.vicinity||p.formatted_address, rating:p.rating, place_id:id, _type:t,
               __prog: 0,
             });
           }
-          await sleep(80);
+          await sleep(50);
         }
-        poisRaw = arr.sort((a,b)=> (b.rating??0)-(a.rating??0));
+        candidates.sort((a,b)=> (b.rating??0)-(a.rating??0));
       } else {
-        // 沿路搜尋：依進度排序（避免同日來回南北）
-        poisRaw = await placesAlongRoute(r.polyline);
+        candidates = await placesAlongRoute(r.polyline);
       }
 
-      // 3) 限量保留，避免太多
-      const poisCapped = poisRaw.slice(0, 100);
-
-      // 4) 依進度切等分、產生旅行社式日程
+      // 3) 限量保留 + 旅行社分配
+      const poisCapped = candidates.slice(0, 120);
       const safeDays = Math.max(1, Math.min(14, Number.isFinite(days) ? days : 5));
-      const itinerary = buildAgencyStyleItineraryByProgress(poisCapped, safeDays);
+      const itinerary = buildAgencyStyleItinerary(poisCapped, safeDays);
 
-      // 5) 只對「被選入日程的點」做反向地理編碼，前置 city 至 address
+      // 4) 僅對「入選點」補 city（反地理 + 正則備援），並前置到 address
       const chosenIds = new Set<string>();
       itinerary.forEach(d=>{
         [...d.morning, d.lunch, ...d.afternoon, d.lodging].forEach((p:any)=>{ if(p?.place_id) chosenIds.add(p.place_id); });
@@ -329,18 +332,15 @@ export async function POST(req: NextRequest) {
       for (const p of poisCapped) {
         if (!p.place_id || !chosenIds.has(p.place_id)) continue;
         try {
-          const city = await reverseCity(p.lat, p.lng);
-          p.city = city;
-          if (p.address) {
-            p.address = city ? `${city} · ${p.address}` : p.address;
-          } else if (city) {
-            p.address = city;
+          p.city = (await reverseCity(p.lat, p.lng)) || extractCityFromAddress(p.address);
+          ensureCityPrefixed(p);
+          await sleep(25);
+        } catch {
+          ensureCityPrefixed(p);
           }
-          await sleep(30);
-        } catch {}
       }
 
-      // 6) 回傳
+      // 5) 回傳
       return NextResponse.json({
           provider: 'google',
         polyline: r.polyline.map(({lat,lng})=>[lat,lng]) as [number,number][],
@@ -348,12 +348,11 @@ export async function POST(req: NextRequest) {
         end:   { lat:r.end.lat,   lng:r.end.lng,   address:r.end.address },
           distanceText: r.distanceText,
           durationText: r.durationText,
-        pois: poisCapped.map(({__prog, ...rest})=>rest), // 兼容舊欄位
-        itinerary,                                        // 新欄位（早/午/下午/住宿）
+        pois: poisCapped.map(({__prog, ...rest})=>rest), // for markers
+        itinerary,
       }, { headers: { 'Cache-Control': 'private, max-age=60' }});
 
     } else {
-      // 沒有 Google Key：只用 OSRM 回路線，不做餐廳/住宿/景點
       const o=await geocodeOSM(origin), d=await geocodeOSM(destination);
       const ro=await routeOSRM({lat:o.lat,lng:o.lng},{lat:d.lat,lng:d.lng});
       return NextResponse.json({
@@ -371,5 +370,4 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// 可選：若你想在 Edge Runtime 執行（降低冷啟動），取消註解
 // export const runtime = 'edge';

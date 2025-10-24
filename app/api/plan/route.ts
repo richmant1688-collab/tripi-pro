@@ -3,7 +3,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import polyline from 'polyline';
 
 type LatLng = { lat: number; lng: number };
-type PlaceType = 'tourist_attraction' | 'restaurant' | 'lodging';
+type PlaceType =
+  | 'tourist_attraction' | 'restaurant' | 'lodging'
+  | 'park' | 'museum' | 'art_gallery' | 'amusement_park' | 'zoo' | 'aquarium'
+  | 'place_of_worship' | 'campground' | 'rv_park' | 'natural_feature' | 'point_of_interest';
 
 type PlaceOut = {
   name: string;
@@ -18,7 +21,16 @@ type PlaceOut = {
 type DaySlot = { morning: PlaceOut[]; lunch?: PlaceOut; afternoon: PlaceOut[]; lodging?: PlaceOut };
 
 const LANG = 'zh-TW';
-const TYPES: PlaceType[] = ['tourist_attraction', 'restaurant', 'lodging'];
+
+// 更廣的「可視為景點」型別（提升密度）
+const ATTRACTION_TYPES: PlaceType[] = [
+  'tourist_attraction','park','museum','art_gallery','amusement_park','zoo','aquarium',
+  'place_of_worship','campground','rv_park','natural_feature','point_of_interest'
+];
+// 餐廳 / 住宿
+const REST_TYPES: PlaceType[] = ['restaurant'];
+const HOTEL_TYPES: PlaceType[] = ['lodging'];
+
 const NEAR_EQ_KM = 3;
 
 /* ---------------- utils ---------------- */
@@ -30,8 +42,8 @@ function sampleAlongPathDynamic(path:LatLng[]){
   if(!path.length) return [];
   const cum=cumulativeLengthKm(path), total=cum[cum.length-1];
   if(total===0) return [path[0]];
-  const step=Math.max(10, Math.min(30, total/28));
-  const n=Math.min(64, Math.max(6, Math.round(total/step)+1));
+  const step=Math.max(10, Math.min(28, total/30));
+  const n=Math.min(72, Math.max(8, Math.round(total/step)+1));
   const out:LatLng[]=[];
   for(let i=0;i<n;i++){
     const target=(i/(n-1))*total; let j=0; while(j<cum.length && cum[j]<target) j++;
@@ -43,10 +55,13 @@ function sampleAlongPathDynamic(path:LatLng[]){
       out.push({lat:A.lat+(B.lat-A.lat)*r, lng:A.lng+(B.lng-A.lng)*r});
     }
   }
+  // 去重：彼此 <6km 視為同一採樣點
   const dedup:LatLng[]=[]; for(const p of out){ if(!dedup.some(q=>haversineKm(p,q)<6)) dedup.push(p); }
   return dedup;
 }
-function dynamicRadiusMeters(totalKm:number){ return Math.min(42000, Math.max(14000, Math.round(totalKm*40))); }
+// 放寬半徑：長途時最多 60km
+function dynamicRadiusMeters(totalKm:number){ return Math.min(60000, Math.max(18000, Math.round(totalKm*45))); }
+
 function extractCityFromAddress(addr?:string){
   if(!addr) return;
   const rep=addr.replace(/台北/g,'臺北').replace(/台中/g,'臺中').replace(/台南/g,'臺南').replace(/台東/g,'臺東');
@@ -66,15 +81,6 @@ function ensureCityPrefixed(p:PlaceOut){
 }
 
 /* ---------------- Google APIs ---------------- */
-async function geocodeGoogle(q:string){
-  const k=process.env.GOOGLE_MAPS_API_KEY!;
-  const base='https://maps.googleapis.com/maps/api/geocode/json';
-  let j=await fetchJson<any>(`${base}?address=${encodeURIComponent(q)}&language=${LANG}&region=tw&key=${k}`);
-  if(!j.results?.[0]) j=await fetchJson<any>(`${base}?address=${encodeURIComponent(q)}&language=${LANG}&key=${k}`);
-  if(!j.results?.[0]) throw new Error(j.error_message||'geocode_failed');
-  const g=j.results[0];
-  return {lat:g.geometry.location.lat, lng:g.geometry.location.lng, formatted:g.formatted_address};
-}
 async function reverseCity(lat:number,lng:number){
   try{
     const k=process.env.GOOGLE_MAPS_API_KEY!;
@@ -118,59 +124,88 @@ function progressRatio(path:LatLng[],pt:LatLng){
   for(let i=0;i<path.length;i++){ const d=haversineKm(pt,path[i]); if(d<best){best=d; bi=i;} }
   return path.length>1? bi/(path.length-1):0;
 }
-async function placesAlongRoute(path:LatLng[]):Promise<Array<PlaceOut & {__prog:number}>>{
+
+/* -------- 採樣沿線：拆成 景點/餐廳/住宿 三池，含 __prog -------- */
+async function placesAlongRoute(path:LatLng[]){
   const samples=sampleAlongPathDynamic(path);
   const total=haversineKm(path[0],path[path.length-1]);
   const radius=dynamicRadiusMeters(total);
-  const map=new Map<string,{item:PlaceOut & {__prog:number},score:number}>();
-  for(const s of samples){
-    for(const t of TYPES){
-      const arr=await nearby(s,t,radius);
-      for(const p of arr){
-        const id=p.place_id as string|undefined; if(!id) continue;
-        const loc:LatLng={lat:p.geometry.location.lat,lng:p.geometry.location.lng};
-        const item:PlaceOut & {__prog:number}={
-          name:p.name,lat:loc.lat,lng:loc.lng,
-          address:p.vicinity||p.formatted_address,
-          rating:p.rating,place_id:id,_type:t,
+
+  const Amap = new Map<string,{item:(PlaceOut & {__prog:number}),score:number}>();
+  const Rmap = new Map<string,{item:(PlaceOut & {__prog:number}),score:number}>();
+  const Hmap = new Map<string,{item:(PlaceOut & {__prog:number}),score:number}>();
+
+  const push = (m:Map<string,{item:PlaceOut & {__prog:number},score:number}>, t:PlaceType, p:any, s:LatLng) => {
+    const id=p.place_id as string|undefined; if(!id) return;
+    const loc:LatLng={ lat:p.geometry.location.lat, lng:p.geometry.location.lng };
+    const sc=scorePlace(p, haversineKm(s,loc));
+    const item:PlaceOut & {__prog:number} = {
+      name:p.name, lat:loc.lat, lng:loc.lng,
+      address:p.vicinity||p.formatted_address, rating:p.rating, place_id:id, _type:t,
           __prog:progressRatio(path,loc)
         };
-        const sc=scorePlace(p,haversineKm(s,loc));
-        const cur=map.get(id);
-        if(!cur||sc>cur.score) map.set(id,{item,score:sc});
+    const cur=m.get(id);
+    if(!cur || sc>cur.score) m.set(id,{item,score:sc});
+  };
+
+  for(const s of samples){
+    for(const t of ATTRACTION_TYPES){
+      const arr=await nearby(s,t,radius);
+      for(const p of arr) push(Amap,t,p,s);
+      await sleep(35);
     }
-      await sleep(40);
+    for(const t of REST_TYPES){
+      const arr=await nearby(s,t,Math.min(radius,35000));
+      for(const p of arr) push(Rmap,t,p,s);
+      await sleep(25);
+    }
+    for(const t of HOTEL_TYPES){
+      const arr=await nearby(s,t,Math.min(radius,35000));
+      for(const p of arr) push(Hmap,t,p,s);
+      await sleep(25);
   }
   }
-  return Array.from(map.values()).map(x=>x.item).sort((a,b)=> a.__prog-b.__prog || (b.rating??0)-(a.rating??0));
+
+  const A = Array.from(Amap.values()).map(v=>v.item).sort((a,b)=> a.__prog-b.__prog || (b.rating??0)-(a.rating??0));
+  const R = Array.from(Rmap.values()).map(v=>v.item).sort((a,b)=> a.__prog-b.__prog || (b.rating??0)-(a.rating??0));
+  const H = Array.from(Hmap.values()).map(v=>v.item).sort((a,b)=> a.__prog-b.__prog || (b.rating??0)-(a.rating??0));
+  return { A, R, H };
 }
 
-/* ---------------- itinerary: NO-BACKTRACK guarantee ---------------- */
-function buildItinerarySouthbound(sorted:Array<PlaceOut & {__prog:number}>, days:number): DaySlot[] {
-  const it:DaySlot[]=Array.from({length:days},()=>({morning:[],afternoon:[]}));
-  if(!sorted.length) return it;
+/* ---------------- itinerary：不回頭 + Day1 起點偏好 ---------------- */
+function buildItinerarySouthbound(
+  poolsOrArray:
+    | { A:(PlaceOut & {__prog:number})[]; R:(PlaceOut & {__prog:number})[]; H:(PlaceOut & {__prog:number})[] }
+    | (PlaceOut & {__prog:number})[],
+  days:number,
+  opts?: { startLL?: LatLng; startCity?: string }
+): DaySlot[] {
+  // 兼容舊呼叫（單一陣列的情況）
+  const pools = Array.isArray(poolsOrArray)
+    ? { A: poolsOrArray.filter(p=>p._type!=='restaurant' && p._type!=='lodging'), R: poolsOrArray.filter(p=>p._type==='restaurant'), H: poolsOrArray.filter(p=>p._type==='lodging') }
+    : poolsOrArray;
 
-  const A=sorted.filter(p=>p._type==='tourist_attraction');
-  const R=sorted.filter(p=>p._type==='restaurant');
-  const H=sorted.filter(p=>p._type==='lodging');
+  const it:DaySlot[]=Array.from({length:days},()=>({morning:[],afternoon:[]}));
+  const A=pools.A, R=pools.R, H=pools.H;
+  if(!A.length) return it;
 
   const used=new Set<string>();
   const key=(p:PlaceOut)=>p.place_id || `${p.name}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
-  const eps = 0.01;            // 最小前進步長
-  let lastProg = -eps;         // 上日最大進度
+  const eps = 0.01;
+  let lastProg = -eps;
 
-    const remain = (arr:typeof A)=>arr.filter(p=>!used.has(key(p)));
+  const remain = (arr:(PlaceOut & {__prog:number})[])=>arr.filter(p=>!used.has(key(p)));
 
   for(let d=0; d<days; d++){
     const s=d/days, e=(d+1)/days, mid=(s+e)/2, target=(s+e)/2;
-    const fwdMin = lastProg + eps;   // 當天所有選點必須 > fwdMin
+    const fwdMin = lastProg + eps;
 
-    // 1) 當日區間內且往前
+    // 1) 區間內且往前
     let cand = remain(A).filter(p=>p.__prog>fwdMin && p.__prog<e);
 
-    // 2) 不足 → 放寬到 e+0.25（仍需 > fwdMin）
+    // 2) 不足 → 放寬到 e+0.3（仍需 > fwdMin）
     if (cand.length < 2) {
-      const more = remain(A).filter(p=>p.__prog>fwdMin && p.__prog<Math.min(1, e+0.25));
+      const more = remain(A).filter(p=>p.__prog>fwdMin && p.__prog<Math.min(1, e+0.30));
       const ids=new Set(cand.map(key)); for(const x of more){ if(!ids.has(key(x))) cand.push(x); }
     }
 
@@ -185,12 +220,43 @@ function buildItinerarySouthbound(sorted:Array<PlaceOut & {__prog:number}>, days
       }
     }
 
-    // 4) 最後保底：若仍 <2，找「進度 > fwdMin」的最前面幾個（純前進，不回頭）
+    // 4) 最後保底：仍 <2 時，取「最靠前的 2 個」（仍需 > fwdMin）
     if (cand.length < 2) {
       const anyFwd = remain(A).filter(p=>p.__prog>fwdMin).sort((a,b)=> a.__prog-b.__prog || (b.rating??0)-(a.rating??0));
       for (const g of anyFwd){
         if (cand.length>=2) break;
         if (!cand.find(x=>key(x)===key(g))) cand.push(g);
+      }
+    }
+
+    // —— Day1 boost：第 1 天上午優先靠近起點或同縣市（仍遵守不回頭）——
+    if (d === 0 && opts?.startLL) {
+      const start = opts.startLL;
+      const nearKm = 30;                                     // 起點 30km 內視為近
+      const preferCity = opts.startCity?.split(' ')[0];      // "臺北市 大安區" -> "臺北市"
+
+      const forwardPool = remain(A).filter(p => p.__prog > fwdMin);
+      const nearStart = forwardPool
+        .filter(p => p.__prog < 0.20) // 路徑前 20% 視為 Day1 前段
+        .filter(p => {
+          const within = haversineKm(start, {lat:p.lat, lng:p.lng}) <= nearKm;
+          const inferred = p.city || extractCityFromAddress(p.address || '') || '';
+          const sameCity = !!preferCity && inferred.startsWith(preferCity);
+          return within || sameCity;
+        })
+        .sort((a,b) =>
+          haversineKm(start, {lat:a.lat,lng:a.lng}) - haversineKm(start, {lat:b.lat,lng:b.lng}) ||
+          (b.rating ?? 0) - (a.rating ?? 0)
+        );
+
+      const need = Math.max(0, 2 - Math.min(2, cand.length));
+      const inject: typeof cand = [];
+      for (const p of nearStart) {
+        if (inject.length >= need) break;
+        if (!cand.find(x => key(x) === key(p))) inject.push(p);
+      }
+      if (inject.length) {
+        cand = [...inject, ...cand].slice(0, 4);
       }
     }
 
@@ -207,14 +273,14 @@ function buildItinerarySouthbound(sorted:Array<PlaceOut & {__prog:number}>, days
     it[d].morning=morning;
     it[d].afternoon=afternoon;
 
-    // 更新 lastProg（如果當天仍沒選到點，就把進度推到 e）
+    // 進度推進（當日無點也推到區間尾）
     const todayMax = cand.length ? Math.max(...cand.map(p=>p.__prog)) : e;
     lastProg = Math.max(lastProg, todayMax);
 
-    // 午餐：盡量選「__prog ≥ fwdMin」且接近今日點群中心；若當日無點，則挑接近 target 且 __prog ≥ fwdMin 的餐廳
+    // 午餐：只用 __prog ≥ fwdMin 的餐廳；若當日無點，用接近 target 的餐廳
     if(R.length){
     let best:PlaceOut|undefined, bs=-1;
-      const poolBase = R.filter((r:any)=> r.__prog>=fwdMin);
+      const poolBase = R.filter(r=> (r as any).__prog>=fwdMin);
       if (poolBase.length){
         const pts=[...morning, ...afternoon];
       if(pts.length){
@@ -224,27 +290,27 @@ function buildItinerarySouthbound(sorted:Array<PlaceOut & {__prog:number}>, days
           if(sc>bs){bs=sc; best=r;}
         }
       }else{
-          best = poolBase
-            .slice()
-            .sort((a:any,b:any)=> Math.abs(a.__prog-target)-Math.abs(b.__prog-target) || (b.rating??0)-(a.rating??0))[0];
+          best = poolBase.slice().sort((a:any,b:any)=> Math.abs(a.__prog-target)-Math.abs(b.__prog-target) || (b.rating??0)-(a.rating??0))[0];
         }
       }
       if(best) it[d].lunch=best;
   }
 
-    // 住宿：優先「__prog ≥ max(fwdMin, e-0.15)」，接近 e 的旅館；若找不到，再放寬只要 ≥ fwdMin
+    // 住宿：優先 __prog ≥ max(fwdMin, e-0.15)，否則 ≥ fwdMin
     if(H.length){
       const lower = Math.max(fwdMin, e-0.15);
     const usedHotels=new Set<string>(it.slice(0,d).map(x=>x.lodging).filter(Boolean).map(h=>key(h!)));
-      const pref = H
-        .filter((h:any)=>h.__prog>=lower && !usedHotels.has(key(h)))
-        .sort((a:any,b:any)=> Math.abs(a.__prog-e)-Math.abs(b.__prog-e) || (b.rating??0)-(a.rating??0));
-      const alt  = H
-        .filter((h:any)=>h.__prog>=fwdMin && !usedHotels.has(key(h)))
-        .sort((a:any,b:any)=> Math.abs(a.__prog-e)-Math.abs(b.__prog-e) || (b.rating??0)-(a.rating??0));
+      const pref = H.filter((h:any)=>h.__prog>=lower && !usedHotels.has(key(h))).sort((a:any,b:any)=> Math.abs(a.__prog-e)-Math.abs(b.__prog-e) || (b.rating??0)-(a.rating??0));
+      const alt  = H.filter((h:any)=>h.__prog>=fwdMin && !usedHotels.has(key(h))).sort((a:any,b:any)=> Math.abs(a.__prog-e)-Math.abs(b.__prog-e) || (b.rating??0)-(a.rating??0));
       const hotel = pref[0] || alt[0];
     if(hotel) it[d].lodging=hotel;
   }
+
+    // Day1：若 city 還空，先以起點縣市預設，方便後續地址前置
+    if (d === 0 && (opts?.startCity)) {
+      const all: PlaceOut[] = [...morning, ...(it[d].lunch? [it[d].lunch] : []), ...afternoon].filter(Boolean) as PlaceOut[];
+      for (const p of all) { if (!p.city) p.city = opts.startCity; ensureCityPrefixed(p); }
+    }
   }
 
   return it;
@@ -265,37 +331,49 @@ export async function POST(req:NextRequest){
       const start={lat:r.start.lat,lng:r.start.lng}, end={lat:r.end.lat,lng:r.end.lng};
       const close=haversineKm(start,end)<=NEAR_EQ_KM;
 
-      let cands:Array<PlaceOut & {__prog:number}>=[];
+      // 起點縣市（優先反地理，不行則從地址猜）
+      const startCity = (await reverseCity(start.lat, start.lng)) || extractCityFromAddress(r.start.address);
+
+      let A: (PlaceOut & {__prog:number})[] = [];
+      let R: (PlaceOut & {__prog:number})[] = [];
+      let H: (PlaceOut & {__prog:number})[] = [];
 
       if(close){
+        // 起終點很近：以起點為中心抓一圈
         const k=process.env.GOOGLE_MAPS_API_KEY!;
-        for(const t of TYPES){
-          const j=await fetchJson<any>(`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${start.lat},${start.lng}&radius=5000&type=${t}&language=${LANG}&key=${k}`);
-          const arr = Array.isArray(j.results)?j.results:[];
-          for(const p of arr){
-            const id=p.place_id as string|undefined; if(!id) continue;
-            cands.push({ name:p.name, lat:p.geometry.location.lat, lng:p.geometry.location.lng, address:p.vicinity||p.formatted_address, rating:p.rating, place_id:id, _type:t, __prog:0 });
-          }
-          await sleep(30);
-        }
-        cands.sort((a,b)=>(b.rating??0)-(a.rating??0));
+        const center=start, radius=15000;
+        for (const t of ATTRACTION_TYPES){ const j=await fetchJson<any>(`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${center.lat},${center.lng}&radius=${radius}&type=${t}&language=${LANG}&key=${k}`); const arr=j.results||[]; for(const p of arr){ A.push({ name:p.name, lat:p.geometry.location.lat, lng:p.geometry.location.lng, address:p.vicinity||p.formatted_address, rating:p.rating, place_id:p.place_id, _type:t, __prog:0 }); } await sleep(25); }
+        for (const t of REST_TYPES){ const j=await fetchJson<any>(`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${center.lat},${center.lng}&radius=${radius}&type=${t}&language=${LANG}&key=${k}`); const arr=j.results||[]; for(const p of arr){ R.push({ name:p.name, lat:p.geometry.location.lat, lng:p.geometry.location.lng, address:p.vicinity||p.formatted_address, rating:p.rating, place_id:p.place_id, _type:t, __prog:0 }); } await sleep(25); }
+        for (const t of HOTEL_TYPES){ const j=await fetchJson<any>(`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${center.lat},${center.lng}&radius=${radius}&type=${t}&language=${LANG}&key=${k}`); const arr=j.results||[]; for(const p of arr){ H.push({ name:p.name, lat:p.geometry.location.lat, lng:p.geometry.location.lng, address:p.vicinity||p.formatted_address, rating:p.rating, place_id:p.place_id, _type:t, __prog:0 }); } await sleep(25); }
+        A = A.sort((a,b)=>(b.rating??0)-(a.rating??0));
+        R = R.sort((a,b)=>(b.rating??0)-(a.rating??0));
+        H = H.sort((a,b)=>(b.rating??0)-(a.rating??0));
       }else{
-        cands = await placesAlongRoute(r.polyline);
+        const pools = await placesAlongRoute(r.polyline);
+        A = pools.A; R = pools.R; H = pools.H;
           }
 
-      const cap=cands.slice(0,220);
-      const safeDays=Math.max(1,Math.min(14, Number.isFinite(days)?days:5));
-      const itinerary=buildItinerarySouthbound(cap, safeDays);
+      // 不再做過小的上限裁切（最多取 900 個）
+      A = A.slice(0,900); R = R.slice(0,900); H = H.slice(0,900);
 
-      // 只對入選點做反地理 & 正常化
-      const chosenIds=new Set<string>(); itinerary.forEach(d=>[...d.morning,d.lunch,...d.afternoon,d.lodging].forEach((p:any)=>{ if(p?.place_id) chosenIds.add(p.place_id); }));
-      for(const p of cap){
-        if(p.place_id && chosenIds.has(p.place_id)){ try{ p.city=(await reverseCity(p.lat,p.lng))||extractCityFromAddress(p.address); }catch{ p.city=extractCityFromAddress(p.address); } }
-        else { p.city=extractCityFromAddress(p.address); }
-        ensureCityPrefixed(p); await sleep(6);
+      const safeDays=Math.max(1,Math.min(14, Number.isFinite(days)?days:5));
+      const itinerary=buildItinerarySouthbound({A,R,H}, safeDays, { startLL:start, startCity });
+
+      // —— 反地理 + 地址前置（僅對入選點）——
+      const chosen = new Set<string>();
+      itinerary.forEach(d=>[...d.morning,d.lunch,...d.afternoon,d.lodging].forEach((p:any)=>{ if(p?.place_id) chosen.add(p.place_id); }));
+
+      for(const pool of [A,R,H]){
+        for(const p of pool){
+          if(p.place_id && chosen.has(p.place_id)){
+            try{ p.city=(await reverseCity(p.lat,p.lng))||extractCityFromAddress(p.address); }catch{ p.city=extractCityFromAddress(p.address); }
+            ensureCityPrefixed(p);
+            await sleep(6);
+          }
+        }
       }
-      const norm=(q?:PlaceOut)=>{ if(q) ensureCityPrefixed(q); };
-      for(const d of itinerary){ d.morning.forEach(ensureCityPrefixed); norm(d.lunch); d.afternoon.forEach(ensureCityPrefixed); norm(d.lodging); }
+      // 保險：再跑一遍地址前置
+      itinerary.forEach(d=>{ d.morning.forEach(ensureCityPrefixed); if(d.lunch) ensureCityPrefixed(d.lunch); d.afternoon.forEach(ensureCityPrefixed); if(d.lodging) ensureCityPrefixed(d.lodging); });
 
       return NextResponse.json({
         provider:'google',
@@ -303,7 +381,7 @@ export async function POST(req:NextRequest){
         start:{lat:r.start.lat,lng:r.start.lng,address:r.start.address},
         end:{lat:r.end.lat,lng:r.end.lng,address:r.end.address},
         distanceText:r.distanceText, durationText:r.durationText,
-        pois: cap.map(({__prog, ...rest})=>rest),
+        pois: A.concat(R,H).map(({__prog, ...rest})=>rest),
         itinerary,
       }, { headers:{'Cache-Control':'private, max-age=60'} });
 

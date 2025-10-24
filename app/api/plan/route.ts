@@ -145,7 +145,7 @@ async function placesAlongRoute(path:LatLng[]):Promise<Array<PlaceOut & {__prog:
   return Array.from(map.values()).map(x=>x.item).sort((a,b)=> a.__prog-b.__prog || (b.rating??0)-(a.rating??0));
 }
 
-/* ---------------- itinerary: hard southbound & hard floor ---------------- */
+/* ---------------- itinerary: NO-BACKTRACK guarantee ---------------- */
 function buildItinerarySouthbound(sorted:Array<PlaceOut & {__prog:number}>, days:number): DaySlot[] {
   const it:DaySlot[]=Array.from({length:days},()=>({morning:[],afternoon:[]}));
   if(!sorted.length) return it;
@@ -156,27 +156,28 @@ function buildItinerarySouthbound(sorted:Array<PlaceOut & {__prog:number}>, days
 
   const used=new Set<string>();
   const key=(p:PlaceOut)=>p.place_id || `${p.name}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
-  let lastProg=-0.02; // 前一日最大進度
+  const eps = 0.01;            // 最小前進步長
+  let lastProg = -eps;         // 上日最大進度
 
     const remain = (arr:typeof A)=>arr.filter(p=>!used.has(key(p)));
 
   for(let d=0; d<days; d++){
     const s=d/days, e=(d+1)/days, mid=(s+e)/2, target=(s+e)/2;
+    const fwdMin = lastProg + eps;   // 當天所有選點必須 > fwdMin
 
-    // 1) 先挑「今天區間內，且進度大於 lastProg」的點
-    let cand = remain(A).filter(p=>p.__prog>lastProg+0.01 && p.__prog<e);
+    // 1) 當日區間內且往前
+    let cand = remain(A).filter(p=>p.__prog>fwdMin && p.__prog<e);
 
-    // 2) 若不足，再放寬到 e+0.25（仍需 > lastProg）
+    // 2) 不足 → 放寬到 e+0.25（仍需 > fwdMin）
     if (cand.length < 2) {
-      const more = remain(A).filter(p=>p.__prog>lastProg+0.01 && p.__prog<Math.min(1,e+0.25));
-      // 合併去重
+      const more = remain(A).filter(p=>p.__prog>fwdMin && p.__prog<Math.min(1, e+0.25));
       const ids=new Set(cand.map(key)); for(const x of more){ if(!ids.has(key(x))) cand.push(x); }
     }
 
-    // 3) 若仍不足，用全域 fallback：挑「__prog > lastProg」且最接近 target 的點補滿
+    // 3) 全域補點（仍需 > fwdMin）
     if (cand.length < 2) {
       const global = remain(A)
-        .filter(p=>p.__prog>lastProg+0.005)
+        .filter(p=>p.__prog>fwdMin)
         .sort((a,b)=> (Math.abs(a.__prog-target)-Math.abs(b.__prog-target)) || (b.rating??0)-(a.rating??0));
       for (const g of global){
         if (cand.length>=4) break;
@@ -184,58 +185,64 @@ function buildItinerarySouthbound(sorted:Array<PlaceOut & {__prog:number}>, days
       }
     }
 
-    // 4) 最後保證 hard floor：若還 <2，就不看進度直接補到 2
+    // 4) 最後保底：若仍 <2，找「進度 > fwdMin」的最前面幾個（純前進，不回頭）
     if (cand.length < 2) {
-      const any = remain(A).sort((a,b)=> (b.rating??0)-(a.rating??0));
-      for (const g of any){
+      const anyFwd = remain(A).filter(p=>p.__prog>fwdMin).sort((a,b)=> a.__prog-b.__prog || (b.rating??0)-(a.rating??0));
+      for (const g of anyFwd){
         if (cand.length>=2) break;
         if (!cand.find(x=>key(x)===key(g))) cand.push(g);
       }
     }
 
-    // 排序：接近 target 優先，其次評分
+    // 排序與裁切
     cand = cand
       .sort((a,b)=> (Math.abs(a.__prog-target)-Math.abs(b.__prog-target)) || (b.rating??0)-(a.rating??0))
       .slice(0,4);
 
-    // 標記使用
     cand.forEach(p=>used.add(key(p)));
 
-    // 上午/下午切分；若某半空，就平均分配
     const first=cand.filter(p=>p.__prog<=mid), second=cand.filter(p=>p.__prog>mid);
     const morning=(first.length?first:cand.slice(0,Math.min(2,cand.length))).slice(0,2);
     const afternoon=(second.length?second:cand.slice(morning.length)).slice(0,2);
     it[d].morning=morning;
     it[d].afternoon=afternoon;
 
-    // 更新 lastProg（就算沒挑到點，也至少推到 e-0.02，避免停滯）
-    const dayMax = Math.max(lastProg, ...cand.map(p=>p.__prog), e-0.02);
-    lastProg = Math.max(lastProg, dayMax);
+    // 更新 lastProg（如果當天仍沒選到點，就把進度推到 e）
+    const todayMax = cand.length ? Math.max(...cand.map(p=>p.__prog)) : e;
+    lastProg = Math.max(lastProg, todayMax);
 
-    // 午餐：靠今日幾何中心；若 cand 空，改用 target 進度挑最近餐廳
-    const pts=[...morning, ...afternoon];
+    // 午餐：盡量選「__prog ≥ fwdMin」且接近今日點群中心；若當日無點，則挑接近 target 且 __prog ≥ fwdMin 的餐廳
     if(R.length){
     let best:PlaceOut|undefined, bs=-1;
+      const poolBase = R.filter((r:any)=> r.__prog>=fwdMin);
+      if (poolBase.length){
+        const pts=[...morning, ...afternoon];
       if(pts.length){
         const cx=pts.reduce((s,p)=>s+p.lat,0)/pts.length, cy=pts.reduce((s,p)=>s+p.lng,0)/pts.length;
-        for(const r of R){
+          for(const r of poolBase){
           const sc=(r.rating||0)/(1+haversineKm({lat:cx,lng:cy},{lat:r.lat,lng:r.lng})/5);
           if(sc>bs){bs=sc; best=r;}
         }
       }else{
-        // 無景點時，用接近 target 的餐廳
-        best = R.slice().sort((a:any,b:any)=> Math.abs(a.__prog-target)-Math.abs(b.__prog-target) || (b.rating??0)-(a.rating??0))[0];
+          best = poolBase
+            .slice()
+            .sort((a:any,b:any)=> Math.abs(a.__prog-target)-Math.abs(b.__prog-target) || (b.rating??0)-(a.rating??0))[0];
+        }
       }
       if(best) it[d].lunch=best;
   }
 
-    // 住宿：接近 e 的旅館；若重複則取次佳
+    // 住宿：優先「__prog ≥ max(fwdMin, e-0.15)」，接近 e 的旅館；若找不到，再放寬只要 ≥ fwdMin
     if(H.length){
+      const lower = Math.max(fwdMin, e-0.15);
     const usedHotels=new Set<string>(it.slice(0,d).map(x=>x.lodging).filter(Boolean).map(h=>key(h!)));
-    const hotel = H
-      .slice()
-        .sort((a:any,b:any)=> Math.abs(a.__prog-e)-Math.abs(b.__prog-e) || (b.rating??0)-(a.rating??0))
-        .find(h=>!usedHotels.has(key(h)));
+      const pref = H
+        .filter((h:any)=>h.__prog>=lower && !usedHotels.has(key(h)))
+        .sort((a:any,b:any)=> Math.abs(a.__prog-e)-Math.abs(b.__prog-e) || (b.rating??0)-(a.rating??0));
+      const alt  = H
+        .filter((h:any)=>h.__prog>=fwdMin && !usedHotels.has(key(h)))
+        .sort((a:any,b:any)=> Math.abs(a.__prog-e)-Math.abs(b.__prog-e) || (b.rating??0)-(a.rating??0));
+      const hotel = pref[0] || alt[0];
     if(hotel) it[d].lodging=hotel;
   }
   }
@@ -280,7 +287,7 @@ export async function POST(req:NextRequest){
       const safeDays=Math.max(1,Math.min(14, Number.isFinite(days)?days:5));
       const itinerary=buildItinerarySouthbound(cap, safeDays);
 
-      // 只對入選點做反地理 & 正常化（避免多餘 API）
+      // 只對入選點做反地理 & 正常化
       const chosenIds=new Set<string>(); itinerary.forEach(d=>[...d.morning,d.lunch,...d.afternoon,d.lodging].forEach((p:any)=>{ if(p?.place_id) chosenIds.add(p.place_id); }));
       for(const p of cap){
         if(p.place_id && chosenIds.has(p.place_id)){ try{ p.city=(await reverseCity(p.lat,p.lng))||extractCityFromAddress(p.address); }catch{ p.city=extractCityFromAddress(p.address); } }

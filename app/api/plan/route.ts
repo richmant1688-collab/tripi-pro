@@ -441,7 +441,7 @@ export async function POST(req: NextRequest) {
         durationText: r.durationText,
         pois,            // 扁平池
         itinerary,       // ✅ 早/午/晚
-      }, { headers: { 'Cache-Control': 'private, max-age': '60' } });
+      }, { headers: { 'Cache-Control': 'private, max-age=60' } });
 
     } else {
       // 無 Google Key：回傳最小可視化資訊

@@ -31,6 +31,16 @@ const TYPES: PlaceType[] = ['tourist_attraction', 'amusement_park', 'restaurant'
 // 視為「同點」門檻（公里），起訖太近就走單點模式
 const NEAR_EQ_KM = 3;
 
+/** 針對大型樂園做全台 TextSearch 注入的查詢詞 */
+const BIG_PARK_QUERIES = [
+  '六福村 主題樂園',
+  '麗寶 樂園',
+  '劍湖山 世界',
+  '義大 世界 樂園',
+  '義大遊樂世界',
+];
+const BIG_PARK_NAME_RE = /(六福|麗寶|劍湖山|義大)/;
+
 /* ---------------- Utils ---------------- */
 function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
 
@@ -56,16 +66,10 @@ function cumulativeDistances(path: LatLng[]) {
   return acc;
 }
 
-/** 將任意點投影到折線上，回傳「距起點累計距離（km）」與百分比（0~1） */
+/** 點投影到折線，回傳距起點累計距離與進度百分比 */
 function progressOnPathKm(path: LatLng[], cum: number[], p: LatLng) {
-  if (path.length === 0) return { km: 0, pct: 0 };
-  if (path.length === 1) return { km: 0, pct: 0 };
-
-  // 找到最近線段（以端點距離初篩，再細算）
-  let bestKm = 0;
-  let bestPct = 0;
-  let bestDist = Infinity;
-
+  if (path.length <= 1) return { km: 0, pct: 0 };
+  let bestKm = 0, bestPct = 0, bestDist = Infinity;
   for (let i = 0; i < path.length - 1; i++) {
     const A = path[i], B = path[i + 1];
     // 以經緯度作為近似向量空間計算投影比例 t（0~1）
@@ -87,7 +91,7 @@ function progressOnPathKm(path: LatLng[], cum: number[], p: LatLng) {
   return { km: bestKm, pct: bestPct };
 }
 
-/** 依總距離自動估樣本數（保守 8~16），沿「距離百分比」等距取樣 */
+/** 等距取樣（8~16點），避免前段過密 */
 function sampleAlongPath(path: LatLng[]) {
   if (!path.length) return [];
   const cum = cumulativeDistances(path);
@@ -98,7 +102,6 @@ function sampleAlongPath(path: LatLng[]) {
   const out: LatLng[] = [];
   for (let i = 0; i < n; i++) {
     const target = (i / (n - 1)) * total;
-    // 在 cum 上二分
     let lo = 0, hi = cum.length - 1;
     while (lo < hi) {
       const mid = Math.floor((lo + hi) / 2);
@@ -111,18 +114,15 @@ function sampleAlongPath(path: LatLng[]) {
       const r = t1 === t0 ? 0 : (target - t0) / (t1 - t0);
       out.push({ lat: A.lat + (B.lat - A.lat) * r, lng: A.lng + (B.lng - A.lng) * r });
     }
-  // 去重（<5km）
   const dedup: LatLng[] = [];
   for (const p of out) if (!dedup.some(q => haversineKm(p, q) < 5)) dedup.push(p);
   return dedup;
 }
 
-/** 後段自動放大半徑：前段較小、後段加大，避免前段壓制 */
 function dynamicRadiusMeters(totalKm: number, progressPct: number) {
-  const base = Math.max(3500, Math.min(7000, Math.round(totalKm * 18))); // 基底
-  const tailBoost = Math.round(Math.pow(progressPct, 1.5) * 6000);       // 後段加成
-  const r = base + tailBoost;
-  return Math.max(3000, Math.min(15000, r));
+  const base = Math.max(3500, Math.min(7000, Math.round(totalKm * 18)));
+  const tailBoost = Math.round(Math.pow(progressPct, 1.5) * 6000);
+  return Math.max(3000, Math.min(15000, base + tailBoost));
 }
 
 /* ---------------- Google Services ---------------- */
@@ -141,16 +141,15 @@ function normCity(s?: string) {
   return s.replace(/^臺/g, '台').replace(/臺/g, '台');
 }
 
-/** 回傳 縣市、市（level_2/locality/level_1）與區（sublocality/level_3） */
 async function reverseCity(lat: number, lng: number): Promise<{ city?: string; district?: string } | undefined> {
   const key = process.env.GOOGLE_MAPS_API_KEY!;
   const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&language=${LANG}&key=${key}`;
   const j = await fetchJson<any>(url);
   const ac: any[] = j.results?.[0]?.address_components || [];
   const pick = (t: string) => ac.find(c => c.types?.includes(t))?.long_name as string | undefined;
-  const locality = pick('locality'); // 市
-  const level2 = pick('administrative_area_level_2'); // 縣市
-  const level1 = pick('administrative_area_level_1'); // 直轄市/省
+  const locality = pick('locality');
+  const level2 = pick('administrative_area_level_2');
+  const level1 = pick('administrative_area_level_1');
   const sublocal = pick('sublocality_level_1') || pick('administrative_area_level_3') || pick('neighborhood');
 
   const city = normCity(locality || level2 || level1);
@@ -181,17 +180,29 @@ async function nearby(center: LatLng, type: PlaceType, radiusM: number) {
   return Array.isArray(j.results) ? j.results : [];
 }
 
-/** 評分：星等×人氣×近樣本×前進加權 */
-function scorePlace(p: any, distKm: number | undefined, progressPct: number) {
-  const rating = p.rating || 0;
-  const urt = p.user_ratings_total || 1;
-  const pop = Math.log10(urt + 1) + 1;                 // 人氣權重
-  const prox = typeof distKm === 'number' ? 1 / (1 + distKm / 5) : 1; // 樣本距離
-  const forward = 0.6 + 0.8 * progressPct;             // 越靠終點越高
-  return rating * pop * prox * forward;
+/** Text Search（全國） */
+async function textSearch(query: string) {
+  const key = process.env.GOOGLE_MAPS_API_KEY!;
+  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&language=${LANG}&region=tw&key=${key}`;
+  const j = await fetchJson<any>(url);
+  if (j.status && j.status !== 'OK' && j.status !== 'ZERO_RESULTS') return [];
+  return Array.isArray(j.results) ? j.results : [];
 }
 
-/* ---------------- POI 搜尋：沿途 & 單點 ---------------- */
+/** 評分：星等×人氣×近樣本×前進加權；大型樂園給 Bonus */
+function scorePlace(p: any, distKm: number | undefined, progressPct: number, forceBigBonus = false) {
+  const rating = p.rating || 0;
+  const urt = p.user_ratings_total || 1;
+  const pop = Math.log10(urt + 1) + 1;
+  const prox = typeof distKm === 'number' ? 1 / (1 + distKm / 5) : 1;
+  const forward = 0.6 + 0.8 * progressPct;
+  const name: string = (p.name || '') as string;
+  const big = forceBigBonus || BIG_PARK_NAME_RE.test(name);
+  const bigBoost = big ? 1.8 : 1.0; // 大型樂園 ×1.8
+  return rating * pop * prox * forward * bigBoost;
+}
+
+/* ---------------- POI：沿途 & 單點 + 大型樂園注入 ---------------- */
 async function placesAlongRoute(path: LatLng[]): Promise<{ list: PlaceOut[]; cum: number[]; totalKm: number }> {
   const cum = cumulativeDistances(path);
   const totalKm = cum[cum.length - 1] || 1;
@@ -199,7 +210,7 @@ async function placesAlongRoute(path: LatLng[]): Promise<{ list: PlaceOut[]; cum
 
   const byId = new Map<string, { item: PlaceOut; score: number; progressPct: number }>();
 
-  // 掃樣本
+  // 先做一般 Nearby（含 amusement_park，但會濾除弱小場）
   for (let si = 0; si < samples.length; si++) {
     const s = samples[si];
     const { pct } = progressOnPathKm(path, cum, s);
@@ -209,6 +220,14 @@ async function placesAlongRoute(path: LatLng[]): Promise<{ list: PlaceOut[]; cum
       const arr = await nearby(s, t, radius);
       for (const p of arr) {
         const id = p.place_id as string | undefined; if (!id) continue;
+
+        // 小型 amusement_park 過濾：若不是大型關鍵字且 urt < 500，直接忽略（避免台北滿地小館）
+        if (t === 'amusement_park') {
+          const urt = p.user_ratings_total || 0;
+          const name: string = p.name || '';
+          if (!BIG_PARK_NAME_RE.test(name) && urt < 500) continue;
+        }
+
         const loc: LatLng = { lat: p.geometry.location.lat, lng: p.geometry.location.lng };
         const dist = haversineKm(s, loc);
         const { pct: pp } = progressOnPathKm(path, cum, loc);
@@ -220,26 +239,32 @@ async function placesAlongRoute(path: LatLng[]): Promise<{ list: PlaceOut[]; cum
         const cur = byId.get(id);
         if (!cur || sc > cur.score) byId.set(id, { item, score: sc, progressPct: pp });
       }
-      await sleep(80); // ▲ 降低節流
+      await sleep(80);
+    }
     }
 
-    // 額外：每 4 個樣本做一次樂園大半徑補撿
-    if (si % 4 === 0) {
-      const parks = await nearby(s, 'amusement_park', Math.max(12000, radius * 1.2));
+  // 再做「大型樂園」Text Search 全國注入：只納入距離路徑 ≤ 30km，進度 0.05~0.98 之間
+  for (const q of BIG_PARK_QUERIES) {
+    const parks = await textSearch(q);
       for (const p of parks) {
         const id = p.place_id as string | undefined; if (!id) continue;
         const loc: LatLng = { lat: p.geometry.location.lat, lng: p.geometry.location.lng };
+      // 找離路徑最近距離（粗略用所有頂點最小距離）
+      let bestD = Infinity;
+      for (const v of path) bestD = Math.min(bestD, haversineKm(loc, v));
+      if (bestD > 30) continue; // 離路徑太遠不收
         const { pct: pp } = progressOnPathKm(path, cum, loc);
-        const sc = (p.rating || 3.8) * (Math.log10((p.user_ratings_total || 50) + 1) + 1) * (0.6 + 0.8 * pp);
+      if (pp < 0.05 || pp > 0.98) continue;
+
+      const sc = scorePlace(p, bestD, pp, true /* force big */);
         const item: PlaceOut = {
           name: p.name, lat: loc.lat, lng: loc.lng,
-          address: p.vicinity || p.formatted_address, rating: p.rating, place_id: id, _type: 'amusement_park'
+        address: p.formatted_address || p.vicinity, rating: p.rating, place_id: id, _type: 'amusement_park'
         };
         const cur = byId.get(id);
         if (!cur || sc > cur.score) byId.set(id, { item, score: sc, progressPct: pp });
       }
-      await sleep(80);
-    }
+    await sleep(120);
   }
 
   const list = Array.from(byId.values())
@@ -255,6 +280,11 @@ async function placesSingleCenter(center: LatLng): Promise<PlaceOut[]> {
     const arr = await nearby(center, t, 4000);
     for (const p of arr) {
       const id = p.place_id as string | undefined; if (!id) continue;
+      if (t === 'amusement_park') {
+        const urt = p.user_ratings_total || 0;
+        const name: string = p.name || '';
+        if (!BIG_PARK_NAME_RE.test(name) && urt < 500) continue;
+      }
       const loc = { lat: p.geometry.location.lat, lng: p.geometry.location.lng };
       const sc = (p.rating || 0) * (Math.log10((p.user_ratings_total || 1) + 1) + 1);
       const item: PlaceOut = { name: p.name, lat: loc.lat, lng: loc.lng, address: p.vicinity || p.formatted_address, rating: p.rating, place_id: id, _type: t };
@@ -267,35 +297,27 @@ async function placesSingleCenter(center: LatLng): Promise<PlaceOut[]> {
 
 /* ---------------- 行程切日（按進度分帶） ---------------- */
 function bandedAgencyItinerary(pois: PlaceOut[], days: number, path: LatLng[], cum: number[]) : DaySlot[] {
-  const total = cum[cum.length - 1] || 1;
   const progress = (p: PlaceOut) => progressOnPathKm(path, cum, { lat: p.lat, lng: p.lng }).pct;
 
-  // 依進度分桶
   const bands: PlaceOut[][] = Array.from({ length: days }, () => []);
   for (const p of pois) {
-    const pct = progress(p);
-    let idx = Math.floor(pct * days);
+    let idx = Math.floor(progress(p) * days);
     if (idx < 0) idx = 0;
     if (idx >= days) idx = days - 1;
     bands[idx].push(p);
   }
-  // 每桶內先依類型優先：amusement_park/tourist_attraction → restaurant → lodging，再依 rating 降序
+
   const typeRank: Record<PlaceType, number> = {
     amusement_park: 0, tourist_attraction: 1, restaurant: 2, lodging: 3
   } as const;
 
   bands.forEach(b => b.sort((a, b2) => (typeRank[a._type] - typeRank[b2._type]) || (b2.rating || 0) - (a.rating || 0)));
 
-  // 產出 DaySlot：每日至多 1–2(早) + 1 餐 + 1–2(午) + 1 住宿，不足向後借、再向前借
-  const takeFromBand = (i: number): PlaceOut[] => bands[i].splice(0, Math.min(8, bands[i].length));
   const daySlots: DaySlot[] = Array.from({ length: days }, () => ({ morning: [], afternoon: [] }));
 
-  // 借用邏輯
   function borrowToFill(i: number, need: number, pred: (p: PlaceOut) => boolean): PlaceOut[] {
     const picked: PlaceOut[] = [];
-    // 先本帶
-    let idxs = [i];
-    // 再往後借，再往前借
+    const idxs: number[] = [i];
     for (let step = 1; step < days && picked.length < need; step++) {
       const r = i + step; if (r < days) idxs.push(r);
       const l = i - step; if (l >= 0) idxs.push(l);
@@ -311,25 +333,22 @@ function bandedAgencyItinerary(pois: PlaceOut[], days: number, path: LatLng[], c
         }
 
   for (let d = 0; d < days; d++) {
-    const base = takeFromBand(d);
+    const base = bands[d].splice(0, Math.min(8, bands[d].length));
 
-    // 先取景點
     const attractions = base.filter(p => p._type === 'amusement_park' || p._type === 'tourist_attraction');
-    // 不足再借
+
     if (attractions.length < 3) {
-      const need = 3 - attractions.length;
-      const extra = borrowToFill(d, need, p => p._type === 'amusement_park' || p._type === 'tourist_attraction');
+      const extra = borrowToFill(d, 3 - attractions.length, p => p._type === 'amusement_park' || p._type === 'tourist_attraction');
       attractions.push(...extra);
     }
 
-    // 切早/午景點（各 1–2）
     const morning = attractions.slice(0, Math.min(2, attractions.length));
     const afternoon = attractions.slice(morning.length, Math.min(morning.length + 2, attractions.length));
 
     daySlots[d].morning = morning;
     daySlots[d].afternoon = afternoon;
 
-    // 午餐（靠近本日所有景點幾何中心）
+    // 午餐：靠近本日幾何中心
     const dayPts = [...morning, ...afternoon];
     if (dayPts.length) {
     const cx = dayPts.reduce((s, p) => s + p.lat, 0) / dayPts.length;
@@ -347,11 +366,10 @@ function bandedAgencyItinerary(pois: PlaceOut[], days: number, path: LatLng[], c
         }
         return best;
       };
-      const lunch = pickResto([d]) || pickResto([d + 1, d - 1].filter(x => x >= 0 && x < days)) || undefined;
-      if (lunch) daySlots[d].lunch = lunch;
+      daySlots[d].lunch = pickResto([d]) || pickResto([d + 1, d - 1].filter(x => x >= 0 && x < days));
       }
 
-    // 住宿（靠近下午最後一點；若無則靠近任一景點）
+    // 住宿：靠近下午最後一個點；若無則靠近期末點
     const anchor = daySlots[d].afternoon[daySlots[d].afternoon.length - 1] || dayPts[dayPts.length - 1];
     if (anchor) {
       const pickHotel = (poolIdx: number[]) => {
@@ -367,8 +385,7 @@ function bandedAgencyItinerary(pois: PlaceOut[], days: number, path: LatLng[], c
         }
         return best;
       };
-      const lodging = pickHotel([d]) || pickHotel([d + 1, d - 1].filter(x => x >= 0 && x < days)) || undefined;
-      if (lodging) daySlots[d].lodging = lodging;
+      daySlots[d].lodging = pickHotel([d]) || pickHotel([d + 1, d - 1].filter(x => x >= 0 && x < days));
     }
   }
 
@@ -386,12 +403,8 @@ function prependCityToAddress(p: PlaceOut, city?: string, district?: string) {
 
   if (p.address) {
     const addr = p.address || '';
-    // 避免重複（已含市名/區名）
     if (city && addr.includes(city)) return;
-    if (district && addr.includes(district)) {
-      p.address = `${city ? city + ' · ' : ''}${addr}`;
-      return;
-    }
+    if (district && addr.includes(district)) { p.address = `${city ? city + ' · ' : ''}${addr}`; return; }
     p.address = `${prefix} · ${addr}`;
   } else {
     p.address = prefix;
@@ -414,7 +427,6 @@ export async function POST(req: NextRequest) {
     const hasGoogle = !!process.env.GOOGLE_MAPS_API_KEY;
 
     if (!hasGoogle) {
-      // 無金鑰：回傳最小骨架（不做 POI）
       return NextResponse.json(
         {
           provider: 'osrm',
@@ -428,7 +440,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1) 路徑
+    // 1) 路線
       const r = await routeGoogle(origin, destination);
     const startLL = { lat: r.start.lat, lng: r.start.lng };
     const endLL = { lat: r.end.lat, lng: r.end.lng };
@@ -439,23 +451,21 @@ export async function POST(req: NextRequest) {
     let cum: number[] = [], totalKm = 0;
 
     if (nearlySame) {
-      // 單點模式（起點附近）
       pois = await placesSingleCenter(startLL);
       cum = [0]; totalKm = 0;
       } else {
       const along = await placesAlongRoute(r.polyline);
-      // 控制上限，避免過量
-      pois = along.list.slice(0, 80);
+      pois = along.list.slice(0, 90); // 上限
       cum = cumulativeDistances(r.polyline);
       totalKm = along.totalKm;
       }
 
-    // 3) 切日（進度分帶）
+    // 3) 切日（進度分帶 + 旅行社邏輯）
     const itinerary = nearlySame
       ? bandedAgencyItinerary(pois, days, [startLL, endLL], [0, haversineKm(startLL, endLL)])
       : bandedAgencyItinerary(pois, days, r.polyline, cum);
 
-    // 4) 只對「入選點」做反地理，前置縣市（「臺」→「台」）
+    // 4) 只對入選點反地理，前置縣市
     const chosenIds = new Set<string>();
       itinerary.forEach(d => {
       [...d.morning, d.lunch, ...d.afternoon, d.lodging].forEach((p: any) => {
@@ -483,8 +493,8 @@ export async function POST(req: NextRequest) {
         end: { lat: r.end.lat, lng: r.end.lng, address: r.end.address },
         distanceText: r.distanceText,
         durationText: r.durationText,
-        pois,            // 扁平池（含 _type）
-        itinerary,       // 早/午/晚
+        pois,
+        itinerary,
       },
       { headers: { 'Cache-Control': 'private, max-age=60' } }
     );

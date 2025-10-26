@@ -18,17 +18,17 @@ type PlaceOut = {
 };
 
 type DaySlot = {
-  morning: PlaceOut[]; // 1–2 景點（含 amusement_park）
-  lunch?: PlaceOut;    // 1 餐廳
-  afternoon: PlaceOut[]; // 1–2 景點
-  lodging?: PlaceOut;    // 1 住宿
+  morning: PlaceOut[];   // 1–2
+  lunch?: PlaceOut;      // 1
+  afternoon: PlaceOut[]; // 1–2
+  lodging?: PlaceOut;    // 1
 };
 
 const LANG = 'zh-TW';
 const TYPES: PlaceType[] = ['tourist_attraction', 'amusement_park', 'restaurant', 'lodging'];
 const NEAR_EQ_KM = 3;
 
-/** 大型樂園注入的關鍵字 */
+/** 大型樂園注入（只留四大系統） */
 const BIG_PARK_QUERIES = [
   '六福村 主題樂園',
   '麗寶 樂園',
@@ -75,9 +75,8 @@ function progressOnPath(path: LatLng[], cum: number[], p: LatLng) {
     if (d<bestDist){
       bestDist=d;
       const km=cum[i] + haversineKm(A, proj);
-      bestKm=km;
       const total=cum[cum.length-1] || 1e-9;
-      bestPct=Math.max(0, Math.min(1, km/total));
+      bestKm=km; bestPct=Math.max(0, Math.min(1, km/total));
     }
   }
   return { km:bestKm, pct:bestPct };
@@ -105,6 +104,7 @@ function sampleAlongPath(path: LatLng[]) {
     const r=t1===t0?0:(target-t0)/(t1-t0);
     out.push({ lat:A.lat+(B.lat-A.lat)*r, lng:A.lng+(B.lng-A.lng)*r });
     }
+  // 去重（5km）
   const dedup:LatLng[]=[];
   for (const p of out) if (!dedup.some(q=>haversineKm(p,q)<5)) dedup.push(p);
   return dedup;
@@ -137,7 +137,7 @@ async function reverseCity(lat:number,lng:number): Promise<{city?:string; distri
   const ac: any[] = j.results?.[0]?.address_components || [];
   const pick = (t:string)=>ac.find(c=>c.types?.includes(t))?.long_name as string|undefined;
 
-  // 台灣多數情況：city 在 level_2 / locality；district 在 sublocality_level_1 / level_3
+  // 台灣：city 在 locality / level_2 / level_1；district 在 sublocality_level_1 / level_3
   const locality = pick('locality');
   const level2 = pick('administrative_area_level_2');
   const level1 = pick('administrative_area_level_1');
@@ -179,7 +179,7 @@ async function textSearch(query: string) {
   return Array.isArray(j.results)? j.results : [];
 }
 
-/** 評分：星等×人氣×近樣本×前進加權；大型樂園給 Bonus */
+/** 評分：星等×人氣×近樣本×前進加權；大型樂園加乘 */
 function scorePlace(p:any, distKm:number|undefined, progressPct:number, forceBig=false){
   const rating=p.rating||0;
   const urt=p.user_ratings_total||1;
@@ -211,7 +211,7 @@ async function placesAlongRoute(path:LatLng[]){
         if (t==='amusement_park'){
           const urt=p.user_ratings_total||0;
           const name:string=p.name||'';
-          if (!BIG_PARK_NAME_RE.test(name) && urt < 500) continue; // 小型親子館濾掉
+          if (!BIG_PARK_NAME_RE.test(name) && urt < 500) continue; // 濾掉小型親子館
       }
 
         const loc:LatLng={ lat:p.geometry.location.lat, lng:p.geometry.location.lng };
@@ -276,94 +276,143 @@ async function placesSingleCenter(center:LatLng): Promise<PlaceOut[]>{
   return Array.from(byId.values()).sort((a,b)=>b.score-a.score).map(x=>x.item);
 }
 
-/* ---------------- 行程切日（嚴格前進視窗，不向過去借點） ---------------- */
-function planAgencyStrictForward(pois:PlaceOut[], days:number, path:LatLng[], cum:number[]): DaySlot[] {
+/* ---------------- 行程切日（前進 + 缺口回填） ---------------- */
+function planAgencyStrictForward(pois:PlaceOut[], days:number): DaySlot[] {
   const totalDays = Math.max(1, days|0);
-  const used = new Set<string>(); // 使用過的 place_id
+  const used = new Set<string>(); // 使用過的 place_id 或 fallback key
 
-  // 依進度排序
   const arr = [...pois].sort((a,b)=>(a.__pct??0)-(b.__pct??0));
 
   const daySlots: DaySlot[] = Array.from({length:totalDays}, ()=>({ morning:[], afternoon:[] }));
 
+  function keyOf(p:PlaceOut, idx:number){ return p.place_id || `${p.lat.toFixed(6)},${p.lng.toFixed(6)}#${idx}`; }
   function takeFromWindow(startPct:number, endPct:number, want:number, pred:(p:PlaceOut)=>boolean): PlaceOut[] {
     const picked:PlaceOut[]=[];
-    // 先在視窗內取
+    // 視窗內
     for (let i=0;i<arr.length && picked.length<want;i++){
       const p=arr[i];
-      if (used.has(p.place_id||`@${i}`)) continue;
+      const k=keyOf(p,i);
+      if (used.has(k)) continue;
       const pct = p.__pct ?? 0;
       if (pct>=startPct && pct<endPct && pred(p)) {
-        picked.push(p); used.add(p.place_id||`@${i}`);
+        picked.push(p); used.add(k);
       }
     }
-    // 若不足，僅向「未來」擴張（不往前）
-    let expand = endPct;
-    while (picked.length < want && expand < 1.0001) {
-      const nextEnd = Math.min(1.0001, expand + 0.12); // 逐步放寬
+    // 不足：僅向「未來」擴張
+    let expandEnd = endPct;
+    while (picked.length < want && expandEnd < 1.0001) {
+      const nextEnd = Math.min(1.0001, expandEnd + 0.18); // 擴張步伐更大，避免撈不到
       for (let i=0;i<arr.length && picked.length<want;i++){
         const p=arr[i];
-        if (used.has(p.place_id||`@${i}`)) continue;
+        const k=keyOf(p,i);
+        if (used.has(k)) continue;
         const pct = p.__pct ?? 0;
-        if (pct>=expand && pct<nextEnd && pred(p)) {
-          picked.push(p); used.add(p.place_id||`@${i}`);
+        if (pct>=expandEnd && pct<nextEnd && pred(p)) {
+          picked.push(p); used.add(k);
         }
       }
-      expand = nextEnd;
-      if (expand >= 1.0001) break;
+      expandEnd = nextEnd;
+      if (expandEnd >= 1.0001) break;
     }
     return picked;
   }
+
+  const isAttraction = (p:PlaceOut)=> p._type==='amusement_park' || p._type==='tourist_attraction';
 
   for (let d=0; d<totalDays; d++){
     const startPct = d / totalDays;
     const endPct   = (d+1) / totalDays;
 
-    // 景點優先：大型樂園 > 一般景點
-    const isAttraction = (p:PlaceOut)=> p._type==='amusement_park' || p._type==='tourist_attraction';
-
-    // 早上 1–2
+    // 早上 1–2（大型樂園優先，自然混入）
     const morning = takeFromWindow(startPct, endPct, 2, isAttraction);
-    // 下午 1–2（排除上午已拿者）
+    // 下午 1–2
     const afternoon = takeFromWindow(startPct, endPct, Math.max(0, 2 - Math.max(0, morning.length-1)), isAttraction);
 
     daySlots[d].morning = morning.slice(0,2);
     daySlots[d].afternoon = afternoon.slice(0,2);
 
-    // 午餐：靠近本日幾何中心（向未來擴張選餐廳）
+    // 午餐：靠近日內幾何中心（可向未來少量擴張）
     const pts=[...daySlots[d].morning, ...daySlots[d].afternoon];
     if (pts.length){
       const cx=pts.reduce((s,p)=>s+p.lat,0)/pts.length;
       const cy=pts.reduce((s,p)=>s+p.lng,0)/pts.length;
-      const resto = takeFromWindow(startPct, endPct, 1, p=>p._type==='restaurant')
-        .concat(takeFromWindow(endPct, endPct+0.2, 1, p=>p._type==='restaurant'))
-        .sort((a,b)=>{
+      const cand = [
+        ...takeFromWindow(startPct, endPct, 2, p=>p._type==='restaurant'),
+        ...takeFromWindow(endPct, endPct+0.25, 2, p=>p._type==='restaurant'),
+      ];
+      cand.sort((a,b)=>{
           const da=haversineKm({lat:cx,lng:cy},{lat:a.lat,lng:a.lng});
           const db=haversineKm({lat:cx,lng:cy},{lat:b.lat,lng:b.lng});
           const ra=(a.rating||0), rb=(b.rating||0);
-          return (ra/ (1+da/5)) > (rb/(1+db/5)) ? -1 : 1;
-        })[0];
-      if (resto) daySlots[d].lunch = resto;
+        return (rb/(1+db/5)) - (ra/(1+da/5));
+      });
+      if (cand[0]) daySlots[d].lunch = cand[0];
     }
 
-    // 住宿：靠近午後最後一個點；若無則靠近本日最後一點
+    // 住宿：靠近午後最後一點（向未來擴張）
     const anchor = daySlots[d].afternoon[daySlots[d].afternoon.length-1] || daySlots[d].morning[daySlots[d].morning.length-1];
     if (anchor){
-      const hotel = takeFromWindow(startPct, endPct+0.15, 1, p=>p._type==='lodging')
-        .sort((a,b)=>{
+      const hotels = [
+        ...takeFromWindow(startPct, endPct, 2, p=>p._type==='lodging'),
+        ...takeFromWindow(endPct, endPct+0.2, 2, p=>p._type==='lodging'),
+      ];
+      hotels.sort((a,b)=>{
           const da=haversineKm(anchor,{lat:a.lat,lng:a.lng});
           const db=haversineKm(anchor,{lat:b.lat,lng:b.lng});
           const ra=(a.rating||0), rb=(b.rating||0);
-          return (ra/ (1+da/5)) > (rb/(1+db/5)) ? -1 : 1;
-        })[0];
-      if (hotel) daySlots[d].lodging = hotel;
+        return (rb/(1+db/5)) - (ra/(1+da/5));
+      });
+      if (hotels[0]) daySlots[d].lodging = hotels[0];
     }
   }
 
   return daySlots;
 }
 
-/* ---------------- 地址前置（只處理入選點，避免重複） ---------------- */
+/** 若有任何一天空白，從未使用 POI 中「只往更大的 __pct」補齊，保障每天都有行程 */
+function ensureDailyCoverage(it: DaySlot[], pois: PlaceOut[]) {
+  const used = new Set<string>();
+  const keyOf = (p:PlaceOut,i:number)=> p.place_id || `${p.lat.toFixed(6)},${p.lng.toFixed(6)}#${i}`;
+  it.forEach(d=>{
+    [...d.morning, d.lunch, ...d.afternoon, d.lodging].forEach((p:any,i)=>{ if(p) used.add(keyOf(p,i)); });
+  });
+
+  const sorted = [...pois].sort((a,b)=>(a.__pct??0)-(b.__pct??0));
+  let cursorPct = Math.max(0, ...it.flatMap(d=>[...d.morning, ...d.afternoon].map(p=>p?.__pct??0)));
+
+  const pickNext = (pred:(p:PlaceOut)=>boolean)=> {
+    for (let i=0;i<sorted.length;i++){
+      const p=sorted[i];
+      const k=keyOf(p,i);
+      if (used.has(k)) continue;
+      const pct=p.__pct??0;
+      if (pct >= cursorPct && pred(p)) { used.add(k); cursorPct=pct; return p; }
+    }
+    return undefined;
+  };
+
+  for (const d of it){
+    // 若一整天沒有景點 → 補 2 個 attraction
+    if (d.morning.length + d.afternoon.length === 0){
+      const a1 = pickNext(p=>p._type==='amusement_park' || p._type==='tourist_attraction');
+      const a2 = pickNext(p=>p._type==='amusement_park' || p._type==='tourist_attraction');
+      if (a1) d.morning = [a1];
+      if (a2) d.afternoon = [a2];
+    }
+    // 沒餐廳 → 補餐廳
+    if (!d.lunch){
+      const r = pickNext(p=>p._type==='restaurant');
+      if (r) d.lunch = r;
+    }
+    // 沒住宿 → 補住宿
+    if (!d.lodging){
+      const h = pickNext(p=>p._type==='lodging');
+      if (h) d.lodging = h;
+    }
+  }
+}
+
+/* ---------------- 地址前置（兩路都處理：pois 與 itinerary） ---------------- */
 function prependCityToAddress(p: PlaceOut, city?: string, district?: string) {
   const parts:string[]=[];
   if (city) parts.push(city);
@@ -373,13 +422,41 @@ function prependCityToAddress(p: PlaceOut, city?: string, district?: string) {
   if (!prefix) return;
 
     const addr = p.address || '';
-  // 已含 city 則不再重複；若已含 district 但缺 city，補 city 前綴即可
-    if (city && addr.includes(city)) return;
+  if (city && addr.includes(city)) { p.address = addr; return; }
   if (district && addr.includes(district)) {
     p.address = city ? `${city} · ${addr}` : addr;
     return;
   }
   p.address = `${prefix} · ${addr}`;
+}
+
+async function prefixAddressesForChosen(pois:PlaceOut[], itinerary:DaySlot[]) {
+  // 蒐集所有「實際顯示的 slot 物件」做反地理（保證覆蓋 UI）
+  const targets: PlaceOut[] = [];
+  itinerary.forEach(d=>{
+    if (d.morning) targets.push(...d.morning);
+    if (d.lunch) targets.push(d.lunch);
+    if (d.afternoon) targets.push(...d.afternoon);
+    if (d.lodging) targets.push(d.lodging);
+  });
+
+  // 去重（以 place_id 優先，否則以座標聚類）
+  const uniq: PlaceOut[] = [];
+  const seen = new Set<string>();
+  for (const p of targets){
+    const k = p.place_id || `${p.lat.toFixed(6)},${p.lng.toFixed(6)}`;
+    if (seen.has(k)) continue;
+    seen.add(k); uniq.push(p);
+  }
+
+  for (const p of uniq){
+    try{
+      const { city, district } = await reverseCity(p.lat, p.lng);
+      if (city) p.city = city;
+      prependCityToAddress(p, city, district);
+      await sleep(35);
+    } catch {}
+  }
 }
 
 /* ---------------- Handler ---------------- */
@@ -397,7 +474,6 @@ export async function POST(req: NextRequest) {
     const hasGoogle = !!process.env.GOOGLE_MAPS_API_KEY;
 
     if (!hasGoogle) {
-      // 無金鑰：回傳最小骨架
       return NextResponse.json({
         provider:'osrm',
           polyline: [],
@@ -422,31 +498,19 @@ export async function POST(req: NextRequest) {
       pois = await placesSingleCenter(startLL);
       } else {
       const along = await placesAlongRoute(r.polyline);
-      pois = along.list.slice(0, 90);
+      pois = along.list.slice(0, 100);
       path = r.polyline;
       cum = along.cum;
       }
 
-    // 3) 切日（嚴格前進）
-    const itinerary = planAgencyStrictForward(pois, days, path, cum);
+    // 3) 切日（前進）
+    const itinerary = planAgencyStrictForward(pois, days);
 
-    // 4) 只對「入選」反地理，加上「縣市 · 區」前綴
-    const chosen = new Set<string>();
-    itinerary.forEach(d=>{
-      [...d.morning, d.lunch, ...d.afternoon, d.lodging].forEach((p:any)=>{
-        if (p?.place_id) chosen.add(p.place_id);
-      });
-      });
+    // 3.5) 缺口回填（保證每天都有早/午/晚）
+    ensureDailyCoverage(itinerary, pois);
 
-      for (const p of pois) {
-      if (!p.place_id || !chosen.has(p.place_id)) continue;
-        try {
-        const { city, district } = await reverseCity(p.lat, p.lng);
-        if (city) p.city = city;
-        prependCityToAddress(p, city, district);
-        await sleep(40);
-      } catch {}
-      }
+    // 4) 為實際顯示的 slot 執行反地理並前綴（保證 UI 有縣市 · 區）
+    await prefixAddressesForChosen(pois, itinerary);
 
     return NextResponse.json({
         provider: 'google',

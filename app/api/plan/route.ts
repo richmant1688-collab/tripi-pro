@@ -51,13 +51,13 @@ const NEAR_EQ_KM = 3;
 
 /** 擴充的景點類型（古蹟、寺廟、步道、博物館、花園、遊樂園等） */
 const ATTRACTION_TYPES: PlaceType[] = [
-  'tourist_attraction', // 綜合：古蹟/打卡/自然/步道 多數會落在這
-  'park',               // 公園、花園、綠地
-  'museum',             // 博物館
-  'amusement_park',     // 遊樂園（六福村、劍湖山、麗寶、義大）
-  'zoo',                // 動物園
-  'aquarium',           // 水族館
-  'place_of_worship',   // 寺/宮/廟（多半也會是 tourist_attraction，但這裡保險）
+  'tourist_attraction',
+  'park',
+  'museum',
+  'amusement_park',
+  'zoo',
+  'aquarium',
+  'place_of_worship',
 ];
 
 /** 餐廳與住宿保留，行程拼裝需要 */
@@ -66,9 +66,7 @@ const HOTEL_TYPES: PlaceType[] = ['lodging'];
 
 /** 提升古蹟/步道/博物館/花園探索覆蓋的中文關鍵字（Nearby 可加 keyword） */
 const ATTRACTION_CN_KEYWORDS = [
-  '古蹟','遺址','寺','宮','廟','祠','步道','健行','登山',
-  '博物館','展館','美術館','園區','花園','花海','森林','景觀',
-  '遊樂園','樂園','親子','水族館','動物園'
+  '古蹟','步道','博物館','花園','樂園','水族館','動物園','美術館'
 ];
 
 /** ---------------- Utils ---------------- */
@@ -96,14 +94,14 @@ function cumulativeLengthKm(path: LatLng[]) {
   return acc;
 }
 
-/** 依路線動態採樣點：長程更多採樣、短程也至少取 6-10 個點 */
+/** 依路線動態採樣點：長程更多採樣、短程也至少取 8-24 個點（較先前更輕量） */
 function sampleAlongPathDynamic(path: LatLng[]) {
   if (!path.length) return [];
   const cum = cumulativeLengthKm(path);
   const total = cum[cum.length - 1];
-  const minN = 10; // 最少採樣點，提升沿途覆蓋
-  const maxN = 40; // 最多採樣點，避免超限
-  const n = Math.max(minN, Math.min(maxN, Math.ceil(total / 20) + 10));
+  const minN = 8;
+  const maxN = 24;
+  const n = Math.max(minN, Math.min(maxN, Math.ceil(total / 30) + 8));
   const positions: LatLng[] = [];
   for (let i = 0; i < n; i++) {
     const target = (i / (n - 1)) * total;
@@ -124,28 +122,38 @@ function sampleAlongPathDynamic(path: LatLng[]) {
   return dedup;
 }
 
-/** 依全程距離調整半徑（往南擴大搜尋） */
+/** 依全程距離調整半徑（往南擴大搜尋，上限 15km，控制請求量） */
 function dynamicRadiusMeters(totalKm: number) {
-  // 長程更大半徑，最高 25km
-  const base = Math.min(25000, Math.max(5000, Math.round(totalKm * 25)));
+  const base = Math.min(15000, Math.max(4000, Math.round(totalKm * 20)));
   return base;
 }
 
-/** 根據 Google Geocoding 結果，抽取 city/district，並將它們穩定地前置於地址 */
+/** 從 Geocoding components 取出 city/district（針對台灣更穩定） */
 function extractCityDistrict(components: any[]): { city?: string; district?: string } {
-  // 台灣慣例：county/city 在 level_2（例如「台北市」「桃園市」「新北市」「台中市」等）
-  const find = (t: string) => components.find(c => Array.isArray(c.types) && c.types.includes(t))?.long_name as string | undefined;
-  // 先抓 level_2 做 city
-  let city = find('administrative_area_level_2') || find('locality') || find('postal_town');
-  // 區/鎮/里：sublocality_level_1 或 administrative_area_level_3
-  let district = find('sublocality_level_1') || find('administrative_area_level_3') || find('neighborhood');
+  const hasType = (c: any, t: string) => Array.isArray(c.types) && c.types.includes(t);
+  const get = (t: string) => components.find((c: any) => hasType(c, t))?.long_name as string | undefined;
 
-  // 正規化（全形空白去掉）
+  // 台灣常見：縣市在 level_1（台北市/新北市/桃園市/台中市/台南市/高雄市/…）
+  // 次選 locality（部分外島/鄉鎮市可能落這）
+  let city = get('administrative_area_level_1') || get('locality') || get('postal_town') || get('administrative_area_level_2');
+
+  // 區/鎮：level_3 或 sublocality_level_1；再退到 neighborhood/locality
+  let district =
+    get('administrative_area_level_3') ||
+    get('sublocality_level_1') ||
+    get('neighborhood') ||
+    (get('locality') && get('locality') !== city ? get('locality') : undefined);
+
   const norm = (s?: string) => s?.replace(/\s+/g, '')?.replace(/[·・•‧．\.]/g, '') || undefined;
   city = norm(city);
   district = norm(district);
 
-  // 有些地區會把「新竹市」「竹北市」混用，這裡不嘗試糾錯，只做最基本去重
+  // 去掉包含關係造成的重複（如「台北市信義區」→ district 以「信義區」為主）
+  if (city && district && district.startsWith(city)) {
+    district = district.slice(city.length);
+    district = norm(district);
+  }
+
   return { city, district };
 }
 
@@ -155,15 +163,16 @@ function formatAddressWithCity(address?: string, city?: string, district?: strin
   const clean = (s: string) => s.replace(/\s+/g, ' ').trim();
 
   if (city) parts.push(city);
-  if (district && (!city || !district.startsWith(city))) parts.push(district);
+  if (district) parts.push(district);
 
   let rest = address ? clean(address) : '';
   const head = parts.join(' · ');
 
-  // 如果原始 address 已經以「縣市」或「區」開頭，避免重複
+  // 去掉原字串中已重複的開頭（縣市/區）
   if (rest) {
-    const rm = [city, district].filter(Boolean).join('|').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (rm) {
+    const rmRaw = [city, district].filter(Boolean).join('|');
+    if (rmRaw) {
+      const rm = rmRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       rest = rest.replace(new RegExp(`^(${rm})(\\s*·\\s*)?`, 'u'), '');
     }
   }
@@ -202,7 +211,6 @@ async function reverseGeocodeGoogle(lat: number, lng: number) {
   const components = top?.address_components || [];
   const { city, district } = extractCityDistrict(components);
 
-  // Google 回傳的 formatted_address 常常是完整地址（含縣市區），我們要「穩定前置 & 去重」
   const formatted = formatAddressWithCity(top?.formatted_address, city, district);
   return { city, district, formatted };
 }
@@ -283,7 +291,6 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
   const cum = cumulativeLengthKm(path);
   const total = cum[cum.length - 1];
   const progressOf = (pt: LatLng) => {
-    // 以最近頂點近似，取得該點在整體路線上的距離比例（0..1）
     let best = Infinity;
     let bestIdx = 0;
     for (let i = 0; i < path.length; i++) {
@@ -296,10 +303,9 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
 
   const byId = new Map<string, { item: PlaceOut; score: number }>();
 
-  // 1) Attractions（含中文關鍵字增強）
+  // 1) Attractions（中文關鍵字強化：只挑 2 個，降低請求量）
   for (const s of samples) {
     for (const t of ATTRACTION_TYPES) {
-      // 純 type
       const arr = await nearby(s, t, radius);
       for (const p of arr) {
         const id = p.place_id as string | undefined; if (!id) continue;
@@ -309,19 +315,18 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
         const cur = byId.get(id);
         if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
       }
-      await sleep(60);
-      // 附加中文關鍵字（只挑部分，避免配額暴衝）
-      for (const kw of ATTRACTION_CN_KEYWORDS.slice(0, 4)) {
+      await sleep(35);
+      for (const kw of ATTRACTION_CN_KEYWORDS.slice(0, 2)) {
         const arr2 = await nearby(s, t, Math.round(radius * 0.8), kw);
         for (const p of arr2) {
           const id = p.place_id as string | undefined; if (!id) continue;
-          const sc = scorePlace(p, haversineKm(s, { lat: p.geometry.location.lat, lng: p.geometry.location.lng })) * 1.05; // 關鍵字加一點權重
+          const sc = scorePlace(p, haversineKm(s, { lat: p.geometry.location.lat, lng: p.geometry.location.lng })) * 1.05;
           const item = asPlaceOut(p, t, progressOf({ lat: p.geometry.location.lat, lng: p.geometry.location.lng }));
           if (!item) continue;
           const cur = byId.get(id);
           if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
         }
-        await sleep(50);
+        await sleep(30);
       }
     }
   }
@@ -338,7 +343,7 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
         const cur = byId.get(id);
         if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
       }
-      await sleep(50);
+      await sleep(25);
     }
   }
 
@@ -354,7 +359,7 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
         const cur = byId.get(id);
         if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
       }
-      await sleep(50);
+      await sleep(25);
     }
   }
 
@@ -366,11 +371,11 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
     })
     .map(x => x.item);
 
-  // 過濾明顯太靠北（起點附近）且不斷重複的點（去重 by name+區）
+  // 去重 by name+address 開頭
   const seen = new Set<string>();
   const clean: PlaceOut[] = [];
   for (const p of pois) {
-    const k = `${(p.name || '').trim()}@${(p.address || '').slice(0, 20)}`;
+    const k = `${(p.name || '').trim()}@${(p.address || '').slice(0, 24)}`;
     if (seen.has(k)) continue;
     seen.add(k);
     clean.push(p);
@@ -386,17 +391,14 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
   const restaurants = pois.filter(p => FOOD_TYPES.includes(p._type as any));
   const hotels = pois.filter(p => HOTEL_TYPES.includes(p._type as any));
 
-  // 依進度分割成 day-buckets
   for (let d = 0; d < days; d++) {
     const start = d / days;
     const end = (d + 1) / days;
     const bucket = attractions.filter(p => {
       const pr = p.progress ?? 0;
-      // 邊界允許少量重疊，避免空桶
       return pr >= start - 0.03 && pr < end + 0.03;
-    }).slice(0, 30);
+    }).slice(0, 24);
 
-    // 上午/下午各挑 2 個（不夠就從附近回填）
     const pick = (from: PlaceOut[], need: number, picked: Set<string>) => {
       const out: PlaceOut[] = [];
       for (const x of from) {
@@ -441,7 +443,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
     }
   }
 
-  // 若某天 attractions 太少（例如空桶），跨桶回填，確保上午/下午至少 2 個
+  // 跨桶回填，確保上午/下午至少 2 個
   const allAttractionsSorted = attractions.slice().sort((a, b) => (a.progress ?? 0) - (b.progress ?? 0));
   const idOf = (p: PlaceOut) => p.place_id || `${p.name}@${p.lat},${p.lng}`;
   for (let d = 0; d < days; d++) {
@@ -450,18 +452,12 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
     if (needM || needA) {
       const picked = new Set([...itinerary[d].morning, ...itinerary[d].afternoon].map(idOf));
       const start = d / days, end = (d + 1) / days;
-      // 先從鄰近進度挑
       const near = allAttractionsSorted.filter(p => {
         const pr = p.progress ?? 0;
         return pr >= start - 0.1 && pr <= end + 0.1 && !picked.has(idOf(p));
       });
-      while (itinerary[d].morning.length < 2 && near.length) {
-        itinerary[d].morning.push(near.shift()!);
-      }
-      while (itinerary[d].afternoon.length < 2 && near.length) {
-        itinerary[d].afternoon.push(near.shift()!);
-      }
-      // 還不夠就全域回填
+      while (itinerary[d].morning.length < 2 && near.length) itinerary[d].morning.push(near.shift()!);
+      while (itinerary[d].afternoon.length < 2 && near.length) itinerary[d].afternoon.push(near.shift()!);
       const rest = allAttractionsSorted.filter(p => !picked.has(idOf(p)) && !near.includes(p));
       while (itinerary[d].morning.length < 2 && rest.length) itinerary[d].morning.push(rest.shift()!);
       while (itinerary[d].afternoon.length < 2 && rest.length) itinerary[d].afternoon.push(rest.shift()!);
@@ -491,9 +487,8 @@ async function enrichChosenPOIsWithCity(itinerary: DaySlot[], all: PlaceOut[]) {
       p.city = rev.city;
       p.district = rev.district;
       p.address = formatAddressWithCity(p.address, rev.city, rev.district);
-      await sleep(40);
+      await sleep(30);
     } catch {
-      // 反地理失敗就至少把原址清潔一下（不前置）
       if (p.address) p.address = p.address.trim();
     }
   }
@@ -547,17 +542,16 @@ export async function POST(req: NextRequest) {
       const endLL = { lat: r.end.lat, lng: r.end.lng };
       const isSingle = haversineKm(startLL, endLL) <= NEAR_EQ_KM;
 
-      // 2) 採集 POIs（往南擴大半徑，含關鍵字）
+      // 2) 採集 POIs
       let pois: PlaceOut[] = [];
       if (isSingle) {
-        // 即便同城，也仍從多個採樣點拉出多型別 POI，避免只在起點附近
-        const fakePath = [startLL, { lat: startLL.lat - 0.5, lng: startLL.lng + 0.2 }]; // 人工拉出一小段，讓進度/分桶仍生效
+        const fakePath = [startLL, { lat: startLL.lat - 0.5, lng: startLL.lng + 0.2 }];
         pois = await harvestPOIsAlongPath(fakePath);
       } else {
         pois = await harvestPOIsAlongPath(r.polyPts);
       }
 
-      // 3) 產生每日「旅行社風格」行程（上午/下午各 >=2）
+      // 3) 產生每日行程（上午/下午各 >=2）
       const itinerary = buildAgencyStyleItinerary(pois, days);
 
       // 4) 只對入選點做反向地理，並把縣市/行政區穩定前置（強制出現）
@@ -570,8 +564,8 @@ export async function POST(req: NextRequest) {
         end: { lat: r.end.lat, lng: r.end.lng, address: r.end.address },
         distanceText: r.distanceText,
         durationText: r.durationText,
-        pois,       // 扁平池（含 progress）
-        itinerary,  // 早/午/晚（已強制補滿縣市＆上午/下午 >=2）
+        pois,
+        itinerary,
     }, { headers: { 'Cache-Control': 'private, max-age=60' } });
 
     } else {

@@ -1,4 +1,4 @@
-// app/api/plan/route.ts
+﻿// app/api/plan/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import polyline from 'polyline';
 
@@ -25,9 +25,9 @@ type PlaceOut = {
   user_ratings_total?: number;
   place_id?: string;
   _type: PlaceType;
-  city?: string;      // ex. 台北市 / 桃園市 / 新北市...
-  district?: string;  // ex. 信義區 / 大安區...
-  progress?: number;  // 在整體路線上的「前進進度」(0..1)
+  city?: string;      // ex. ?啣?撣?/ 獢?撣?/ ?啣?撣?..
+  district?: string;  // ex. 靽∠儔? / 憭批??...
+  progress?: number;  // ?冽擃楝蝺????脤脣漲??0..1)
 };
 
 type DaySlot = {
@@ -70,22 +70,57 @@ const MIN_HOTEL_RATING = 3.5;
 const MIN_HOTEL_REVIEWS = 20;
 const MAX_POI_DIST_FROM_SAMPLE_KM = 15;
 const NEAR_DUP_KM = 0.35;
-/** 擴充的景點類型（古蹟、寺廟、步道、博物館、花園、遊樂園等） */
+const HARD_NEAR_DUP_KM = 0.18;
+const FOOD_NAME_BLOCKLIST = /(hotel|hostel|apartment|apartments|resort|inn|motel|wohnung|\u9152\u5e97|\u98ef\u5e97|\u65c5\u9928|\u65c5\u5e97|\u6c11\u5bbf)/i;
+const HOTEL_BRAND_IN_FOOD_BLOCKLIST = /(radisson|marriott|hilton|hyatt|intercontinental|holiday\s*inn|guesthouse|trend\s*hotel|trendhotel|wombat)/i;
+const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach)/i;
+const PARK_NAME_BLOCKLIST = /(hundezone|dog\s*park|skate|parkplatz|parking)/i;
+const ATTRACTION_TYPE_WHITELIST = new Set([
+  'tourist_attraction',
+  'museum',
+  'park',
+  'zoo',
+  'aquarium',
+  'place_of_worship',
+  'art_gallery',
+  'church',
+  'hindu_temple',
+  'mosque',
+  'synagogue',
+]);
+const FOOD_TYPE_WHITELIST = new Set([
+  'restaurant',
+  'cafe',
+  'meal_takeaway',
+  'meal_delivery',
+  'bakery',
+  'food',
+]);
+const ATTRACTION_BAD_PRIMARY_TYPES = new Set([
+  'lodging',
+  'restaurant',
+  'cafe',
+  'bar',
+  'night_club',
+  'shopping_mall',
+  'supermarket',
+  'store',
+]);
+/** ?游??暺????方??笑撱郊???拚尹???璅?蝑? */
 const ATTRACTION_TYPES: PlaceType[] = [
   'tourist_attraction',
   'park',
   'museum',
-  'amusement_park',
   'zoo',
   'aquarium',
   'place_of_worship',
 ];
 
-/** 餐廳與住宿保留，行程拼裝需要 */
+/** 擗輒??摰蹂???銵??潸??閬?*/
 const FOOD_TYPES: PlaceType[] = ['restaurant'];
 const HOTEL_TYPES: PlaceType[] = ['lodging'];
 
-/** 提升古蹟/步道/博物館/花園探索覆蓋的中文關鍵字（Nearby 可加 keyword） */
+/** ???方?/甇仿?/?擗??勗??Ｙ揣閬??葉???萄?嚗earby ?臬? keyword嚗?*/
 const ATTRACTION_CN_KEYWORDS = [
   'attraction',
   'museum',
@@ -136,7 +171,7 @@ function cumulativeLengthKm(path: LatLng[]) {
   return acc;
 }
 
-/** 依路線動態採樣點：長程更多採樣、短程也至少取 8-24 個點（較先前更輕量） */
+/** 靘楝蝺??璅??嚗蝔憭璅?蝔??喳???8-24 ??嚗????渲??? */
 function sampleAlongPathDynamic(path: LatLng[]) {
   if (!path.length) return [];
   const cum = cumulativeLengthKm(path);
@@ -167,27 +202,27 @@ function dynamicRadiusMeters(totalKm: number) {
   return base;
 }
 
-/** 從 Geocoding components 取出 city/district（針對台灣更穩定） */
+/** 敺?Geocoding components ? city/district嚗?撠??蝛拙?嚗?*/
 function extractCityDistrict(components: any[]): { city?: string; district?: string } {
   const hasType = (c: any, t: string) => Array.isArray(c.types) && c.types.includes(t);
   const get = (t: string) => components.find((c: any) => hasType(c, t))?.long_name as string | undefined;
 
-  // 台灣常見：縣市在 level_1（台北市/新北市/桃園市/台中市/台南市/高雄市/…）
-  // 次選 locality（部分外島/鄉鎮市可能落這）
+  // ?啁撣貉?嚗腦撣 level_1嚗??/?啣?撣?獢?撣??唬葉撣??啣?撣?擃?撣??佗?
+  // 甈⊿ locality嚗??撜??撣?質??
   let city = get('administrative_area_level_1') || get('locality') || get('postal_town') || get('administrative_area_level_2');
 
-  // 區/鎮：level_3 或 sublocality_level_1；再退到 neighborhood/locality
+  // ?/?殷?level_3 ??sublocality_level_1嚗????neighborhood/locality
   let district =
     get('administrative_area_level_3') ||
     get('sublocality_level_1') ||
     get('neighborhood') ||
     (get('locality') && get('locality') !== city ? get('locality') : undefined);
 
-  const norm = (s?: string) => s?.replace(/\s+/g, '')?.replace(/[·・•‧．\.]/g, '') || undefined;
+  const norm = (s?: string) => s?.replace(/\s+/g, '')?.replace(/[繚?領Ｔ改?\.]/g, '') || undefined;
   city = norm(city);
   district = norm(district);
 
-  // 去掉包含關係造成的重複（如「台北市信義區」→ district 以「信義區」為主）
+  // ?餅????????銴?憒??靽∠儔??? district 隞乓縑蝢拙??銝鳴?
   if (city && district && district.startsWith(city)) {
     district = district.slice(city.length);
     district = norm(district);
@@ -196,7 +231,7 @@ function extractCityDistrict(components: any[]): { city?: string; district?: str
   return { city, district };
 }
 
-/** 乾淨地把「縣市 / 行政區」前置到地址，避免重複顯示 */
+/** 銋暹楊?唳??腦撣?/ 銵???蝵桀?啣?嚗??銴＊蝷?*/
 function formatAddressWithCity(address?: string, city?: string, district?: string) {
   const parts: string[] = [];
   const clean = (s: string) => s.replace(/\s+/g, ' ').trim();
@@ -205,18 +240,17 @@ function formatAddressWithCity(address?: string, city?: string, district?: strin
   if (district) parts.push(district);
 
   let rest = address ? clean(address) : '';
-  const head = parts.join(' · ');
+  const head = parts.join(' 繚 ');
 
-  // 去掉原字串中已重複的開頭（縣市/區）
-  if (rest) {
+  // ?餅???銝脖葉撌脤?銴??嚗腦撣??嚗?  if (rest) {
     const rmRaw = [city, district].filter(Boolean).join('|');
     if (rmRaw) {
       const rm = rmRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      rest = rest.replace(new RegExp(`^(${rm})(\\s*·\\s*)?`, 'u'), '');
+      rest = rest.replace(new RegExp(`^(${rm})(\\s*繚\\s*)?`, 'u'), '');
     }
   }
 
-  return head ? (rest ? `${head} · ${rest}` : head) : (rest || '');
+  return head ? (rest ? `${head} 繚 ${rest}` : head) : (rest || '');
 }
 
 /** ---------------- Google APIs ---------------- */
@@ -283,26 +317,43 @@ function scorePlace(p: any, distKm?: number) {
   return rating * pop * proximity;
 }
 
+function hasAnyGoogleType(p: any, allow: Set<string>) {
+  if (!Array.isArray(p?.types)) return false;
+  return p.types.some((t: string) => allow.has(t));
+}
+
 function isQualifiedPlace(p: any, type: PlaceType, distKm: number) {
   if (!p || !p.geometry?.location) return false;
   if (p.business_status && p.business_status !== 'OPERATIONAL') return false;
   if (distKm > MAX_POI_DIST_FROM_SAMPLE_KM) return false;
 
   const name = String(p.name || '');
+  const types: string[] = Array.isArray(p.types) ? p.types : [];
+  const primaryType = types[0];
+  if (ATTRACTION_TYPES.includes(type) && ATTRACTION_NAME_BLOCKLIST.test(name)) return false;
   if (/(gmbh|flagship|camping|hornbach|monteurzimmer)/i.test(name)) return false;
-  if (FOOD_TYPES.includes(type) && /(hotel|hostel|apartment|apartments|wohnung)/i.test(name)) return false;
+  if (FOOD_TYPES.includes(type) && FOOD_NAME_BLOCKLIST.test(name)) return false;
+  if (FOOD_TYPES.includes(type) && HOTEL_BRAND_IN_FOOD_BLOCKLIST.test(name)) return false;
   if (type === 'place_of_worship' && !/(church|cathedral|temple|mosque|shrine|basilica|synagogue|kirche|dom)/i.test(name)) return false;
 
   const rating = Number(p.rating || 0);
   const reviews = Number(p.user_ratings_total || 0);
 
   if (ATTRACTION_TYPES.includes(type)) {
+    if (!hasAnyGoogleType(p, ATTRACTION_TYPE_WHITELIST)) return false;
+    if (primaryType && ATTRACTION_BAD_PRIMARY_TYPES.has(primaryType)) return false;
+    if (type === 'park' && PARK_NAME_BLOCKLIST.test(name)) return false;
+    if (type === 'park' && reviews < 80) return false;
+    if (type === 'museum' && reviews < 60) return false;
     return rating >= MIN_ATTRACTION_RATING && reviews >= MIN_ATTRACTION_REVIEWS;
   }
   if (FOOD_TYPES.includes(type)) {
+    if (!hasAnyGoogleType(p, FOOD_TYPE_WHITELIST)) return false;
+    if (types.includes('lodging')) return false;
     return rating >= MIN_FOOD_RATING && reviews >= MIN_FOOD_REVIEWS;
   }
   if (HOTEL_TYPES.includes(type)) {
+    if (!types.includes('lodging')) return false;
     return rating >= MIN_HOTEL_RATING && reviews >= MIN_HOTEL_REVIEWS;
   }
   return true;
@@ -353,7 +404,7 @@ async function nearby(center: LatLng, type?: PlaceType, radiusM?: number, keywor
   return nearbyRaw(center, radiusM || 3000, params);
 }
 
-/** 把 result 轉成 PlaceOut */
+/** ??result 頧? PlaceOut */
 function asPlaceOut(result: any, type: PlaceType, progress?: number): PlaceOut | undefined {
   if (!result || !result.geometry?.location) return;
   const loc = result.geometry.location;
@@ -371,7 +422,7 @@ function asPlaceOut(result: any, type: PlaceType, progress?: number): PlaceOut |
   return o;
 }
 
-/** 回傳「依路線進度排序」且多樣化的 POI 集合（含 attractions/food/hotel） */
+/** ???頝舐??脣漲????憭見?? POI ??嚗 attractions/food/hotel嚗?*/
 async function harvestPOIsAlongPath(path: LatLng[]) {
   const samples = sampleAlongPathDynamic(path);
   const totalKm = haversineKm(path[0], path[path.length - 1]);
@@ -478,11 +529,18 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
   const itinerary: DaySlot[] = Array.from({ length: days }, () => ({ morning: [], afternoon: [] }));
   const idOf = (p: PlaceOut) => p.place_id || `${p.name}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
   const normName = (s?: string) => (s || '').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
+  const attractionGroupKey = (p: PlaceOut) => {
+    const n = normName(p.name)
+      .replace(/museum|gallery|park|garden|cathedral|church|palace|schloss|platz|vienna|wien/g, '');
+    return n.slice(0, 12) || normName(p.name).slice(0, 12);
+  };
   const similarAttraction = (a: PlaceOut, b: PlaceOut) => {
     const na = normName(a.name), nb = normName(b.name);
-    const nameClose = na.length >= 5 && nb.length >= 5 && (na.includes(nb) || nb.includes(na));
-    const near = haversineKm({ lat: a.lat, lng: a.lng }, { lat: b.lat, lng: b.lng }) <= NEAR_DUP_KM;
-    return near && nameClose;
+    const nameClose = !!na && !!nb && (na.includes(nb) || nb.includes(na));
+    const km = haversineKm({ lat: a.lat, lng: a.lng }, { lat: b.lat, lng: b.lng });
+    if (km <= HARD_NEAR_DUP_KM) return true;
+    if (km <= 0.8 && attractionGroupKey(a) === attractionGroupKey(b)) return true;
+    return km <= NEAR_DUP_KM && nameClose;
   };
 
   const attractions = pois
@@ -490,8 +548,9 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
     .sort((a, b) => (a.progress ?? 0) - (b.progress ?? 0) || (b.rating ?? 0) - (a.rating ?? 0));
   const restaurants = pois
     .filter(p => FOOD_TYPES.includes(p._type as any))
-    .filter(p => !/(hotel|hostel|apartment|apartments|wohnung)/i.test(p.name || ''));
+    .filter(p => !FOOD_NAME_BLOCKLIST.test(p.name || ''));
   const hotels = pois.filter(p => HOTEL_TYPES.includes(p._type as any));
+  const allowCrossDayRepeat = attractions.length < days * 4;
 
   const usedAttractions = new Set<string>();
   const usedRestaurants = new Set<string>();
@@ -514,6 +573,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       if (out.length >= need) break;
       const id = idOf(p);
       if (dayPicked.has(id)) continue;
+      if (!allowCrossDayRepeat && usedAttractions.has(id)) continue;
       if (dayItems.some(x => similarAttraction(x, p))) continue;
       out.push(p);
       dayPicked.add(id);
@@ -556,7 +616,9 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       for (const r of restaurants) {
         const id = idOf(r);
         if (usedRestaurants.has(id)) continue;
-        const sc = (r.rating || 0) / (1 + haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) / 6);
+        const distKm = haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng });
+        if (distKm > 6) continue;
+        const sc = (r.rating || 0) / (1 + distKm / 6);
         if (sc > bestScore) {
           bestScore = sc;
           bestR = r;
@@ -724,7 +786,7 @@ function formatLongHaulDurationText(distanceKm: number) {
   const hours = distanceKm / 800 + 1.5;
   const h = Math.max(1, Math.floor(hours));
   const m = Math.round((hours - h) * 60);
-  return `約 ${h} 小時 ${m} 分（跨國移動估算）`;
+  return `約 ${h} 小時 ${m} 分（含轉乘與市區接駁）`;
 }
 /** ---------------- OSM/OSRM fallback ---------------- */
 async function geocodeOSM(query: string) {
@@ -749,7 +811,7 @@ async function routeOSRM(origin: LatLng, dest: LatLng) {
   return {
     polyPts: coords as LatLng[],
     distanceText: (route.distance / 1000).toFixed(1) + ' km',
-    durationText: Math.round(route.duration / 60) + ' 分鐘',
+    durationText: Math.round(route.duration / 60) + ' 分',
   };
 }
 

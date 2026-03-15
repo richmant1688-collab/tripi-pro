@@ -1009,10 +1009,24 @@ function formatLongHaulDurationText(distanceKm: number) {
 }
 /** ---------------- OSM/OSRM fallback ---------------- */
 async function geocodeOSM(query: string) {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&addressdetails=1`;
-  const r = await fetch(url, { headers: { 'Accept-Language': LANG }, cache: 'no-store' });
-  const j = await r.json();
-  if (!Array.isArray(j) || !j[0]) throw new Error('geocode_failed');
+  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&accept-language=${encodeURIComponent(LANG)}&q=${encodeURIComponent(query)}`;
+  const r = await fetch(url, {
+    headers: {
+      'Accept': 'application/json',
+      'Accept-Language': LANG,
+      'User-Agent': 'tripi-pro/1.0 (+https://tripi-pro.vercel.app)',
+    },
+    cache: 'no-store',
+  });
+  const raw = await r.text();
+  let j: any;
+  try {
+    j = JSON.parse(raw);
+  } catch {
+    throw new Error(`geocode_osm_non_json:${raw.slice(0, 80)}`);
+  }
+  if (!r.ok) throw new Error(`geocode_osm_http_${r.status}`);
+  if (!Array.isArray(j) || !j[0]) throw new Error('geocode_osm_empty');
   return {
     lat: parseFloat(j[0].lat),
     lng: parseFloat(j[0].lon),

@@ -45,8 +45,8 @@ type DirectionsInfo = {
   durationText: string;
 };
 
-const LANG = 'zh-TW';
-const COUNTRY_REGION = 'tw';
+const DEFAULT_LANG = 'zh-TW';
+const DEFAULT_REGION = 'tw';
 const NEAR_EQ_KM = 3;
 const SAMPLE_MIN = 6;
 const SAMPLE_MAX = 14;
@@ -143,6 +143,38 @@ const FOOD_KEYWORDS = [
   'bistro',
   'viennese',
 ];
+
+function normalizeGoogleLang(input?: string) {
+  const raw = String(input || '').trim().replace(/_/g, '-');
+  const first = raw.split(',')[0]?.split(';')[0]?.trim().toLowerCase();
+  if (!first) return DEFAULT_LANG;
+  if (first.startsWith('zh')) {
+    if (first.includes('hant') || first.includes('tw') || first.includes('hk')) return 'zh-TW';
+    return 'zh-CN';
+  }
+  if (first.startsWith('en')) return 'en';
+  if (first.startsWith('ja')) return 'ja';
+  if (first.startsWith('ko')) return 'ko';
+  if (first.startsWith('de')) return 'de';
+  if (first.startsWith('fr')) return 'fr';
+  if (first.startsWith('es')) return 'es';
+  return first;
+}
+
+function normalizeRegion(input?: string) {
+  const raw = String(input || '').trim().replace(/_/g, '-');
+  const first = raw.split(',')[0]?.split(';')[0]?.trim();
+  if (!first) return DEFAULT_REGION;
+  const m = first.match(/-([A-Za-z]{2})\b/);
+  return (m?.[1] || DEFAULT_REGION).toLowerCase();
+}
+
+function resolveLocale(req: NextRequest, bodyLang?: string, bodyRegion?: string) {
+  const headerLang = req.headers.get('accept-language') || '';
+  const lang = normalizeGoogleLang(bodyLang || headerLang || DEFAULT_LANG);
+  const region = (bodyRegion || normalizeRegion(bodyLang || headerLang || DEFAULT_REGION)).toLowerCase();
+  return { lang, region };
+}
 
 /** ---------------- Utils ---------------- */
 function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
@@ -269,14 +301,15 @@ function formatAddressWithCity(address?: string, city?: string, district?: strin
 }
 
 /** ---------------- Google APIs ---------------- */
-async function geocodeGoogle(query: string) {
+async function geocodeGoogle(query: string, lang: string, region: string) {
   const key = process.env.GOOGLE_MAPS_API_KEY!;
   const base = 'https://maps.googleapis.com/maps/api/geocode/json';
   let lastStatus = '';
   let lastErr = '';
+  const regionPart = region ? `&region=${encodeURIComponent(region)}` : '';
   const tryUrls = [
-    `${base}?address=${encodeURIComponent(query)}&language=${LANG}&region=${COUNTRY_REGION}&key=${key}`,
-    `${base}?address=${encodeURIComponent(query)}&language=${LANG}&key=${key}`,
+    `${base}?address=${encodeURIComponent(query)}&language=${encodeURIComponent(lang)}${regionPart}&key=${key}`,
+    `${base}?address=${encodeURIComponent(query)}&language=${encodeURIComponent(lang)}&key=${key}`,
   ];
   for (const url of tryUrls) {
     const j = await fetchJson<any>(url);
@@ -322,12 +355,12 @@ function expandGeocodeQueries(input: string): string[] {
   return Array.from(out);
 }
 
-async function geocodeAny(query: string) {
+async function geocodeAny(query: string, lang: string, region: string) {
   const variants = expandGeocodeQueries(query);
   let lastErr: any;
   for (const q of variants) {
     try {
-      const g = await geocodeGoogle(q);
+      const g = await geocodeGoogle(q, lang, region);
       return {
         lat: g.lat,
         lng: g.lng,
@@ -340,7 +373,7 @@ async function geocodeAny(query: string) {
   }
   for (const q of variants) {
     try {
-      const o = await geocodeOSM(q);
+      const o = await geocodeOSM(q, lang);
       return {
         lat: o.lat,
         lng: o.lng,
@@ -354,9 +387,9 @@ async function geocodeAny(query: string) {
   throw lastErr || new Error('geocode_any_failed');
 }
 
-async function reverseGeocodeGoogle(lat: number, lng: number) {
+async function reverseGeocodeGoogle(lat: number, lng: number, lang: string) {
   const key = process.env.GOOGLE_MAPS_API_KEY!;
-  const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&language=${LANG}&key=${key}`;
+  const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&language=${encodeURIComponent(lang)}&key=${key}`;
   const j = await fetchJson<any>(url);
   const top = j.results?.[0];
   const components = top?.address_components || [];
@@ -366,9 +399,10 @@ async function reverseGeocodeGoogle(lat: number, lng: number) {
   return { city, district, formatted };
 }
 
-async function directionsGoogle(origin: string, destination: string): Promise<DirectionsInfo> {
+async function directionsGoogle(origin: string, destination: string, lang: string, region: string): Promise<DirectionsInfo> {
   const key = process.env.GOOGLE_MAPS_API_KEY!;
-  const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&language=${LANG}&region=${COUNTRY_REGION}&mode=driving&key=${key}`;
+  const regionPart = region ? `&region=${encodeURIComponent(region)}` : '';
+  const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&language=${encodeURIComponent(lang)}${regionPart}&mode=driving&key=${key}`;
   const j = await fetchJson<any>(url);
   if (j.status !== 'OK' || !j.routes?.[0]) {
     const err = new Error(j.error_message || j.status || 'directions_failed') as Error & { code?: string };
@@ -456,12 +490,12 @@ function isQualifiedPlace(p: any, type: PlaceType, distKm: number) {
   return true;
 }
 
-async function nearbyRaw(center: LatLng, radiusM: number, params: Record<string, string>) {
+async function nearbyRaw(center: LatLng, radiusM: number, params: Record<string, string>, lang: string) {
   const key = process.env.GOOGLE_MAPS_API_KEY!;
   const usp = new URLSearchParams({
     location: `${center.lat},${center.lng}`,
     radius: `${radiusM}`,
-    language: LANG,
+    language: lang,
     key,
   });
   for (const [k, v] of Object.entries(params)) usp.set(k, v);
@@ -494,11 +528,11 @@ async function nearbyRaw(center: LatLng, radiusM: number, params: Record<string,
   }
   return [];
 }
-async function nearby(center: LatLng, type?: PlaceType, radiusM?: number, keyword?: string) {
+async function nearby(center: LatLng, type?: PlaceType, radiusM?: number, keyword?: string, lang = DEFAULT_LANG) {
   const params: Record<string, string> = {};
   if (type) params['type'] = type;
   if (keyword) params['keyword'] = keyword;
-  return nearbyRaw(center, radiusM || 3000, params);
+  return nearbyRaw(center, radiusM || 3000, params, lang);
 }
 
 /** ??result 頧? PlaceOut */
@@ -521,7 +555,7 @@ function asPlaceOut(result: any, type: PlaceType, progress?: number): PlaceOut |
 }
 
 /** ???頝舐??脣漲????憭見?? POI ??嚗 attractions/food/hotel嚗?*/
-async function harvestPOIsAlongPath(path: LatLng[]) {
+async function harvestPOIsAlongPath(path: LatLng[], lang = DEFAULT_LANG) {
   const samples = sampleAlongPathDynamic(path);
   const totalKm = haversineKm(path[0], path[path.length - 1]);
   const radius = dynamicRadiusMeters(totalKm);
@@ -576,14 +610,14 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
     const s = samples[si];
     for (const t of ATTRACTION_TYPES) {
       tasks.push(async () => {
-        const arr = await nearby(s, t, radius);
+        const arr = await nearby(s, t, radius, undefined, lang);
         ingest(arr, t, s);
       });
 
       if (si % 2 === 0) {
         for (const kw of ATTRACTION_CN_KEYWORDS.slice(0, ATTRACTION_KEYWORD_LIMIT)) {
           tasks.push(async () => {
-            const arr2 = await nearby(s, t, Math.round(radius * 0.8), kw);
+            const arr2 = await nearby(s, t, Math.round(radius * 0.8), kw, lang);
             ingest(arr2, t, s, 1.05);
           });
         }
@@ -594,12 +628,12 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
   for (const s of samples) {
     for (const t of FOOD_TYPES) {
       tasks.push(async () => {
-        const arr = await nearby(s, t, Math.max(3500, Math.round(radius * 0.6)));
+        const arr = await nearby(s, t, Math.max(3500, Math.round(radius * 0.6)), undefined, lang);
         ingest(arr, t, s);
       });
       for (const kw of FOOD_KEYWORDS) {
         tasks.push(async () => {
-          const arr2 = await nearby(s, t, Math.max(3000, Math.round(radius * 0.5)), kw);
+          const arr2 = await nearby(s, t, Math.max(3000, Math.round(radius * 0.5)), kw, lang);
           ingest(arr2, t, s, 1.03);
         });
       }
@@ -609,7 +643,7 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
   for (const s of samples) {
     for (const t of HOTEL_TYPES) {
       tasks.push(async () => {
-        const arr = await nearby(s, t, Math.max(5000, Math.round(radius * 0.6)));
+        const arr = await nearby(s, t, Math.max(5000, Math.round(radius * 0.6)), undefined, lang);
         ingest(arr, t, s);
       });
     }
@@ -953,7 +987,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
   return itinerary;
 }
 
-async function enrichChosenPOIsWithCity(itinerary: DaySlot[], all: PlaceOut[]) {
+async function enrichChosenPOIsWithCity(itinerary: DaySlot[], all: PlaceOut[], lang = DEFAULT_LANG) {
 
   const chosenIds = new Set<string>();
   itinerary.forEach(day => {
@@ -970,7 +1004,7 @@ async function enrichChosenPOIsWithCity(itinerary: DaySlot[], all: PlaceOut[]) {
     const key = `${lat.toFixed(5)},${lng.toFixed(5)}`;
     const hit = geoCache.get(key);
     if (hit) return hit;
-    const req = reverseGeocodeGoogle(lat, lng);
+    const req = reverseGeocodeGoogle(lat, lng, lang);
     geoCache.set(key, req);
     return req;
   };
@@ -1078,12 +1112,12 @@ function formatLongHaulDurationText(distanceKm: number) {
   return `約 ${h} 小時 ${m} 分（含轉乘與市區接駁）`;
 }
 /** ---------------- OSM/OSRM fallback ---------------- */
-async function geocodeOSM(query: string) {
-  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&accept-language=${encodeURIComponent(LANG)}&q=${encodeURIComponent(query)}`;
+async function geocodeOSM(query: string, lang = DEFAULT_LANG) {
+  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&accept-language=${encodeURIComponent(lang)}&q=${encodeURIComponent(query)}`;
   const r = await fetch(url, {
     headers: {
       'Accept': 'application/json',
-      'Accept-Language': LANG,
+      'Accept-Language': lang,
       'User-Agent': 'tripi-pro/1.0 (+https://tripi-pro.vercel.app)',
     },
     cache: 'no-store',
@@ -1122,7 +1156,8 @@ async function routeOSRM(origin: LatLng, dest: LatLng) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { origin, destination, days = 5 } = body || {};
+    const { origin, destination, days = 5, lang: bodyLang, region: bodyRegion } = body || {};
+    const locale = resolveLocale(req, bodyLang, bodyRegion);
     if (!origin || !destination) {
       return NextResponse.json(
         { error: 'bad_request', detail: 'origin/destination required' },
@@ -1136,12 +1171,12 @@ export async function POST(req: NextRequest) {
       let r: DirectionsInfo;
       let longHaulFallback = false;
       try {
-        r = await directionsGoogle(origin, destination);
+        r = await directionsGoogle(origin, destination, locale.lang, locale.region);
       } catch (e: any) {
         const code = e?.code || e?.message;
         if (code === 'ZERO_RESULTS' || code === 'NOT_FOUND' || code === 'REQUEST_DENIED' || code === 'INVALID_REQUEST' || code === 'OVER_DAILY_LIMIT') {
-          const o = await geocodeAny(origin);
-          const d = await geocodeAny(destination);
+          const o = await geocodeAny(origin, locale.lang, locale.region);
+          const d = await geocodeAny(destination, locale.lang, locale.region);
           const startLL = { lat: o.lat, lng: o.lng };
           const endLL = { lat: d.lat, lng: d.lng };
           const distanceKm = haversineKm(startLL, endLL);
@@ -1169,16 +1204,16 @@ export async function POST(req: NextRequest) {
       let pois: PlaceOut[] = [];
       if (isSingle) {
         const fakePath = [startLL, { lat: startLL.lat - 0.5, lng: startLL.lng + 0.2 }];
-        pois = await harvestPOIsAlongPath(fakePath);
+        pois = await harvestPOIsAlongPath(fakePath, locale.lang);
       } else if (isLongHaul) {
         // For cross-country routes, plan activities around destination city.
-        pois = await harvestPOIsAlongPath(buildDestinationLocalPath(endLL));
+        pois = await harvestPOIsAlongPath(buildDestinationLocalPath(endLL), locale.lang);
       } else {
-        pois = await harvestPOIsAlongPath(r.polyPts);
+        pois = await harvestPOIsAlongPath(r.polyPts, locale.lang);
       }
 
       const itinerary = buildAgencyStyleItinerary(pois, days);
-      await enrichChosenPOIsWithCity(itinerary, pois);
+      await enrichChosenPOIsWithCity(itinerary, pois, locale.lang);
 
       return NextResponse.json({
         provider: 'google',
@@ -1192,7 +1227,7 @@ export async function POST(req: NextRequest) {
         routeMode: longHaulFallback ? 'long_haul_fallback' : 'driving',
       }, { headers: { 'Cache-Control': 'private, max-age=60' } });
     } else {
-      const o = await geocodeOSM(origin), d = await geocodeOSM(destination);
+      const o = await geocodeOSM(origin, locale.lang), d = await geocodeOSM(destination, locale.lang);
       const ro = await routeOSRM({ lat: o.lat, lng: o.lng }, { lat: d.lat, lng: d.lng });
       return NextResponse.json({
         provider: 'osrm',

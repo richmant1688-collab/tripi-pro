@@ -374,6 +374,20 @@ function resolveRoutingRegion(region: string, origin: string, destination: strin
   return '';
 }
 
+function resolveKnownCity(query: string): { lat: number; lng: number; formatted_address: string } | null {
+  const q = String(query || '').toLowerCase();
+  if (/(布達佩斯|布达佩斯|budapest)/i.test(q)) {
+    return { lat: 47.497913, lng: 19.040236, formatted_address: 'Budapest, Hungary' };
+  }
+  if (/(維也納|维也纳|vienna|wien)/i.test(q)) {
+    return { lat: 48.208174, lng: 16.373819, formatted_address: 'Vienna, Austria' };
+  }
+  if (/(台北|臺北|taipei)/i.test(q)) {
+    return { lat: 25.033964, lng: 121.564468, formatted_address: 'Taipei, Taiwan' };
+  }
+  return null;
+}
+
 async function geocodeAny(query: string, lang: string, region: string) {
   const variants = expandGeocodeQueries(query);
   let lastErr: any;
@@ -1145,6 +1159,35 @@ function mergePoisPreferQuality(...groups: PlaceOut[][]): PlaceOut[] {
   });
 }
 
+function enforceDestinationTailDays(itinerary: DaySlot[], destinationPois: PlaceOut[], tripDays: number): DaySlot[] {
+  if (tripDays < 3 || destinationPois.length < 8) return itinerary;
+  const tailDays = Math.min(2, Math.max(1, tripDays - 1));
+  const localBand = remapProgressBand(destinationPois, 0, 1);
+  const tailPlan = buildAgencyStyleItinerary(localBand, tailDays);
+
+  const out = itinerary.map(day => ({
+    morning: [...day.morning],
+    lunch: day.lunch,
+    afternoon: [...day.afternoon],
+    lodging: day.lodging,
+  }));
+
+  for (let i = 0; i < tailDays; i++) {
+    const src = tailPlan[i];
+    const dstIdx = tripDays - tailDays + i;
+    if (!src) continue;
+    const attractionCount = src.morning.length + src.afternoon.length;
+    if (attractionCount < 2) continue;
+    out[dstIdx] = {
+      morning: [...src.morning],
+      lunch: src.lunch,
+      afternoon: [...src.afternoon],
+      lodging: src.lodging,
+    };
+  }
+  return out;
+}
+
 function buildDestinationLocalPath(center: LatLng): LatLng[] {
   const ring = [
     { lat: center.lat + LONG_HAUL_LOCAL_LAT_SPAN, lng: center.lng },
@@ -1236,6 +1279,7 @@ export async function POST(req: NextRequest) {
       const sameToken = normalizeLocationToken(origin) === normalizeLocationToken(destination);
       let resolvedOrigin: { lat: number; lng: number; formatted_address?: string } | null = null;
       let resolvedDestination: { lat: number; lng: number; formatted_address?: string } | null = null;
+      let destinationPoisForTail: PlaceOut[] = [];
 
       if (!sameToken) {
         try {
@@ -1243,13 +1287,17 @@ export async function POST(req: NextRequest) {
             geocodeAny(origin, locale.lang, routingRegion),
             geocodeAny(destination, locale.lang, routingRegion),
           ]);
-          const preCrow = haversineKm(
-            { lat: oGeo.lat, lng: oGeo.lng },
-            { lat: dGeo.lat, lng: dGeo.lng },
-          );
+          let oFix = { lat: oGeo.lat, lng: oGeo.lng, formatted_address: oGeo.formatted_address };
+          let dFix = { lat: dGeo.lat, lng: dGeo.lng, formatted_address: dGeo.formatted_address };
+          const knownOrigin = resolveKnownCity(origin);
+          const knownDestination = resolveKnownCity(destination);
+          if (knownOrigin) oFix = knownOrigin;
+          if (knownDestination) dFix = knownDestination;
+
+          const preCrow = haversineKm({ lat: oFix.lat, lng: oFix.lng }, { lat: dFix.lat, lng: dFix.lng });
           if (preCrow >= INTERCITY_SUPPLEMENT_KM) {
-            resolvedOrigin = oGeo;
-            resolvedDestination = dGeo;
+            resolvedOrigin = oFix;
+            resolvedDestination = dFix;
           }
         } catch {
           // Keep text-based routing if pre-geocoding is unavailable.
@@ -1335,7 +1383,8 @@ export async function POST(req: NextRequest) {
         pois = await harvestPOIsAlongPath(fakePath, locale.lang);
       } else if (isLongHaul) {
         // For cross-country routes, plan activities around destination city.
-        pois = await harvestPOIsAlongPath(buildDestinationLocalPath(endLL), locale.lang);
+        destinationPoisForTail = await harvestPOIsAlongPath(buildDestinationLocalPath(endLL), locale.lang);
+        pois = destinationPoisForTail;
       } else {
         const needDestinationSupplement = crowKm >= INTERCITY_SUPPLEMENT_KM && tripDays >= 3;
         if (needDestinationSupplement) {
@@ -1343,6 +1392,7 @@ export async function POST(req: NextRequest) {
             harvestPOIsAlongPath(r.polyPts, locale.lang),
             harvestPOIsAlongPath(buildDestinationLocalPath(endLL), locale.lang),
           ]);
+          destinationPoisForTail = destPoisRaw;
           const destPois = remapProgressBand(destPoisRaw, 0.62, 0.98);
           pois = mergePoisPreferQuality(routePois, destPois);
         } else {
@@ -1350,7 +1400,10 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      const itinerary = buildAgencyStyleItinerary(pois, tripDays);
+      let itinerary = buildAgencyStyleItinerary(pois, tripDays);
+      if (crowKm >= INTERCITY_SUPPLEMENT_KM && tripDays >= 3 && destinationPoisForTail.length) {
+        itinerary = enforceDestinationTailDays(itinerary, destinationPoisForTail, tripDays);
+      }
       await enrichChosenPOIsWithCity(itinerary, pois, locale.lang);
 
       return NextResponse.json({

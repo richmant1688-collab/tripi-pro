@@ -77,7 +77,12 @@ const HOTEL_TYPES: PlaceType[] = ['lodging'];
 
 /** 提升古蹟/步道/博物館/花園探索覆蓋的中文關鍵字（Nearby 可加 keyword） */
 const ATTRACTION_CN_KEYWORDS = [
-  '古蹟','步道','博物館','花園','樂園','水族館','動物園','美術館'
+  'attraction',
+  'museum',
+  'historic',
+  'landmark',
+  'temple',
+  'scenic',
 ];
 
 /** ---------------- Utils ---------------- */
@@ -434,89 +439,118 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
 }
 function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
   const itinerary: DaySlot[] = Array.from({ length: days }, () => ({ morning: [], afternoon: [] }));
+  const idOf = (p: PlaceOut) => p.place_id || `${p.name}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
 
-  const attractions = pois.filter(p => ATTRACTION_TYPES.includes(p._type as any));
+  const attractions = pois
+    .filter(p => ATTRACTION_TYPES.includes(p._type as any))
+    .sort((a, b) => (a.progress ?? 0) - (b.progress ?? 0) || (b.rating ?? 0) - (a.rating ?? 0));
   const restaurants = pois.filter(p => FOOD_TYPES.includes(p._type as any));
   const hotels = pois.filter(p => HOTEL_TYPES.includes(p._type as any));
+
+  const usedAttractions = new Set<string>();
+  const usedRestaurants = new Set<string>();
+  const usedHotels = new Set<string>();
+
+  const pickAttractions = (candidates: PlaceOut[], need: number, dayPicked: Set<string>) => {
+    const out: PlaceOut[] = [];
+
+    for (const p of candidates) {
+      if (out.length >= need) break;
+      const id = idOf(p);
+      if (dayPicked.has(id) || usedAttractions.has(id)) continue;
+      out.push(p);
+      dayPicked.add(id);
+      usedAttractions.add(id);
+    }
+
+    for (const p of candidates) {
+      if (out.length >= need) break;
+      const id = idOf(p);
+      if (dayPicked.has(id)) continue;
+      out.push(p);
+      dayPicked.add(id);
+    }
+    return out;
+  };
 
   for (let d = 0; d < days; d++) {
     const start = d / days;
     const end = (d + 1) / days;
     const bucket = attractions.filter(p => {
       const pr = p.progress ?? 0;
-      return pr >= start - 0.03 && pr < end + 0.03;
-    }).slice(0, 24);
+      return pr >= start - 0.08 && pr <= end + 0.08;
+    });
+    const pool = bucket.length ? bucket : attractions;
 
-    const pick = (from: PlaceOut[], need: number, picked: Set<string>) => {
-      const out: PlaceOut[] = [];
-      for (const x of from) {
-        if (out.length >= need) break;
-        const id = x.place_id || `${x.name}@${x.lat.toFixed(3)},${x.lng.toFixed(3)}`;
-        if (picked.has(id)) continue;
-        out.push(x);
-        picked.add(id);
-    }
-      return out;
-  };
+    const dayPicked = new Set<string>();
+    itinerary[d].morning = pickAttractions(pool, 2, dayPicked);
+    itinerary[d].afternoon = pickAttractions(pool, 2, dayPicked);
 
-    const pickedIds = new Set<string>();
-    const m = pick(bucket, 2, pickedIds);
-    const a = pick(bucket.filter(x => !m.includes(x)), 2, pickedIds);
-
-    itinerary[d].morning = m;
-    itinerary[d].afternoon = a;
-
-    // 中午餐廳：取該日早/午景點幾何中心最近評價高者
-    const pts = [...m, ...a];
+    const pts = [...itinerary[d].morning, ...itinerary[d].afternoon];
     if (pts.length) {
       const cx = pts.reduce((s, p) => s + p.lat, 0) / pts.length;
       const cy = pts.reduce((s, p) => s + p.lng, 0) / pts.length;
-      let bestR: PlaceOut | undefined, bestScore = -1;
+      let bestR: PlaceOut | undefined;
+      let bestScore = -1;
+
       for (const r of restaurants) {
+        const id = idOf(r);
+        if (usedRestaurants.has(id)) continue;
         const sc = (r.rating || 0) / (1 + haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) / 6);
-        if (sc > bestScore) { bestScore = sc; bestR = r; }
-    }
-      if (bestR) itinerary[d].lunch = bestR;
-  }
-
-    // 晚上住宿：靠近下午最後一點
-    const anchor = a[a.length - 1] || m[m.length - 1];
-    if (anchor) {
-      let bestH: PlaceOut | undefined, best = -1;
-      for (const h of hotels) {
-        const sc = (h.rating || 0) / (1 + haversineKm({ lat: anchor.lat, lng: anchor.lng }, { lat: h.lat, lng: h.lng }) / 6);
-        if (sc > best) { best = sc; bestH = h; }
+        if (sc > bestScore) {
+          bestScore = sc;
+          bestR = r;
+        }
       }
-      if (bestH) itinerary[d].lodging = bestH;
+      if (!bestR) {
+        for (const r of restaurants) {
+          const sc = (r.rating || 0) / (1 + haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) / 6);
+          if (sc > bestScore) {
+            bestScore = sc;
+            bestR = r;
+          }
+        }
+      }
+      if (bestR) {
+        itinerary[d].lunch = bestR;
+        usedRestaurants.add(idOf(bestR));
+      }
     }
-  }
 
-  // 跨桶回填，確保上午/下午至少 2 個
-  const allAttractionsSorted = attractions.slice().sort((a, b) => (a.progress ?? 0) - (b.progress ?? 0));
-  const idOf = (p: PlaceOut) => p.place_id || `${p.name}@${p.lat},${p.lng}`;
-  for (let d = 0; d < days; d++) {
-    const needM = Math.max(0, 2 - itinerary[d].morning.length);
-    const needA = Math.max(0, 2 - itinerary[d].afternoon.length);
-    if (needM || needA) {
-      const picked = new Set([...itinerary[d].morning, ...itinerary[d].afternoon].map(idOf));
-      const start = d / days, end = (d + 1) / days;
-      const near = allAttractionsSorted.filter(p => {
-        const pr = p.progress ?? 0;
-        return pr >= start - 0.1 && pr <= end + 0.1 && !picked.has(idOf(p));
-      });
-      while (itinerary[d].morning.length < 2 && near.length) itinerary[d].morning.push(near.shift()!);
-      while (itinerary[d].afternoon.length < 2 && near.length) itinerary[d].afternoon.push(near.shift()!);
-      const rest = allAttractionsSorted.filter(p => !picked.has(idOf(p)) && !near.includes(p));
-      while (itinerary[d].morning.length < 2 && rest.length) itinerary[d].morning.push(rest.shift()!);
-      while (itinerary[d].afternoon.length < 2 && rest.length) itinerary[d].afternoon.push(rest.shift()!);
+    const anchor = itinerary[d].afternoon[itinerary[d].afternoon.length - 1] || itinerary[d].morning[itinerary[d].morning.length - 1];
+    if (anchor) {
+      let bestH: PlaceOut | undefined;
+      let bestScore = -1;
+      for (const h of hotels) {
+        const id = idOf(h);
+        if (usedHotels.has(id)) continue;
+        const sc = (h.rating || 0) / (1 + haversineKm({ lat: anchor.lat, lng: anchor.lng }, { lat: h.lat, lng: h.lng }) / 6);
+        if (sc > bestScore) {
+          bestScore = sc;
+          bestH = h;
+        }
+      }
+      if (!bestH) {
+        for (const h of hotels) {
+          const sc = (h.rating || 0) / (1 + haversineKm({ lat: anchor.lat, lng: anchor.lng }, { lat: h.lat, lng: h.lng }) / 6);
+          if (sc > bestScore) {
+            bestScore = sc;
+            bestH = h;
+          }
+        }
+      }
+      if (bestH) {
+        itinerary[d].lodging = bestH;
+        usedHotels.add(idOf(bestH));
+      }
     }
   }
 
   return itinerary;
 }
 
-/** 只對「選上行程」的點做反向地理，並把 city/district 前置到 address */
 async function enrichChosenPOIsWithCity(itinerary: DaySlot[], all: PlaceOut[]) {
+
   const chosenIds = new Set<string>();
   itinerary.forEach(day => {
     [...day.morning, day.lunch, ...day.afternoon, day.lodging].forEach((p: any) => {

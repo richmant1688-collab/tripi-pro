@@ -68,6 +68,9 @@ const MIN_FOOD_RATING = 3.8;
 const MIN_FOOD_REVIEWS = 30;
 const MIN_HOTEL_RATING = 3.5;
 const MIN_HOTEL_REVIEWS = 20;
+const MIN_PARK_REVIEWS = 120;
+const MIN_MUSEUM_REVIEWS = 80;
+const MIN_ZOO_REVIEWS = 200;
 const MAX_POI_DIST_FROM_SAMPLE_KM = 15;
 const NEAR_DUP_KM = 0.35;
 const HARD_NEAR_DUP_KM = 0.18;
@@ -75,6 +78,7 @@ const FOOD_NAME_BLOCKLIST = /(hotel|hostel|apartment|apartments|resort|inn|motel
 const HOTEL_BRAND_IN_FOOD_BLOCKLIST = /(radisson|marriott|hilton|hyatt|intercontinental|holiday\s*inn|guesthouse|trend\s*hotel|trendhotel|wombat)/i;
 const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach)/i;
 const PARK_NAME_BLOCKLIST = /(hundezone|dog\s*park|skate|parkplatz|parking)/i;
+const ZOO_NAME_BLOCKLIST = /(pet\s*shop|tierhandlung|aquaristik|zoo\s*shop|handlung|store)/i;
 const ATTRACTION_TYPE_WHITELIST = new Set([
   'tourist_attraction',
   'museum',
@@ -344,8 +348,10 @@ function isQualifiedPlace(p: any, type: PlaceType, distKm: number) {
     if (!hasAnyGoogleType(p, ATTRACTION_TYPE_WHITELIST)) return false;
     if (primaryType && ATTRACTION_BAD_PRIMARY_TYPES.has(primaryType)) return false;
     if (type === 'park' && PARK_NAME_BLOCKLIST.test(name)) return false;
-    if (type === 'park' && reviews < 80) return false;
-    if (type === 'museum' && reviews < 60) return false;
+    if (type === 'park' && reviews < MIN_PARK_REVIEWS) return false;
+    if (type === 'museum' && reviews < MIN_MUSEUM_REVIEWS) return false;
+    if (type === 'zoo' && ZOO_NAME_BLOCKLIST.test(name)) return false;
+    if (type === 'zoo' && reviews < MIN_ZOO_REVIEWS) return false;
     return rating >= MIN_ATTRACTION_RATING && reviews >= MIN_ATTRACTION_REVIEWS;
   }
   if (FOOD_TYPES.includes(type)) {
@@ -553,8 +559,6 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
     .filter(p => !FOOD_NAME_BLOCKLIST.test(p.name || ''));
   const hotels = pois.filter(p => HOTEL_TYPES.includes(p._type as any));
   const allowCrossDayRepeat = attractions.length < days * 4;
-  const allowRestaurantRepeat = restaurants.length < days;
-  const allowHotelRepeat = hotels.length < days;
 
   const usedAttractions = new Set<string>();
   const usedRestaurants = new Set<string>();
@@ -630,7 +634,17 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       }
       if (!bestR) {
         for (const r of restaurants) {
-          if (!allowRestaurantRepeat && usedRestaurants.has(idOf(r))) continue;
+          const id = idOf(r);
+          if (usedRestaurants.has(id)) continue;
+          const sc = (r.rating || 0) / (1 + haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) / 6);
+          if (sc > bestScore) {
+            bestScore = sc;
+            bestR = r;
+          }
+        }
+      }
+      if (!bestR) {
+        for (const r of restaurants) {
           const sc = (r.rating || 0) / (1 + haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) / 6);
           if (sc > bestScore) {
             bestScore = sc;
@@ -659,7 +673,17 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       }
       if (!bestH) {
         for (const h of hotels) {
-          if (!allowHotelRepeat && usedHotels.has(idOf(h))) continue;
+          const id = idOf(h);
+          if (usedHotels.has(id)) continue;
+          const sc = (h.rating || 0) / (1 + haversineKm({ lat: anchor.lat, lng: anchor.lng }, { lat: h.lat, lng: h.lng }) / 6);
+          if (sc > bestScore) {
+            bestScore = sc;
+            bestH = h;
+          }
+        }
+      }
+      if (!bestH) {
+        for (const h of hotels) {
           const sc = (h.rating || 0) / (1 + haversineKm({ lat: anchor.lat, lng: anchor.lng }, { lat: h.lat, lng: h.lng }) / 6);
           if (sc > bestScore) {
             bestScore = sc;
@@ -781,11 +805,18 @@ function slimPoisForResponse(pois: PlaceOut[], itinerary: DaySlot[], limit = MAX
 }
 
 function buildDestinationLocalPath(center: LatLng): LatLng[] {
-  const latA = Math.max(-85, Math.min(85, center.lat + LONG_HAUL_LOCAL_LAT_SPAN));
-  const lngA = center.lng + LONG_HAUL_LOCAL_LNG_SPAN;
-  const latB = Math.max(-85, Math.min(85, center.lat - LONG_HAUL_LOCAL_LAT_SPAN * 0.7));
-  const lngB = center.lng + LONG_HAUL_LOCAL_LNG_SPAN * 1.2;
-  return [center, { lat: latA, lng: lngA }, { lat: latB, lng: lngB }];
+  const ring = [
+    { lat: center.lat + LONG_HAUL_LOCAL_LAT_SPAN, lng: center.lng },
+    { lat: center.lat + LONG_HAUL_LOCAL_LAT_SPAN * 0.7, lng: center.lng + LONG_HAUL_LOCAL_LNG_SPAN },
+    { lat: center.lat, lng: center.lng + LONG_HAUL_LOCAL_LNG_SPAN * 1.2 },
+    { lat: center.lat - LONG_HAUL_LOCAL_LAT_SPAN * 0.8, lng: center.lng + LONG_HAUL_LOCAL_LNG_SPAN * 0.7 },
+    { lat: center.lat - LONG_HAUL_LOCAL_LAT_SPAN, lng: center.lng - LONG_HAUL_LOCAL_LNG_SPAN * 0.2 },
+    { lat: center.lat - LONG_HAUL_LOCAL_LAT_SPAN * 0.4, lng: center.lng - LONG_HAUL_LOCAL_LNG_SPAN },
+  ].map(p => ({
+    lat: Math.max(-85, Math.min(85, p.lat)),
+    lng: p.lng,
+  }));
+  return [center, ...ring];
 }
 
 function formatLongHaulDurationText(distanceKm: number) {

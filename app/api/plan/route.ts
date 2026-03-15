@@ -69,6 +69,7 @@ const MIN_FOOD_REVIEWS = 30;
 const MIN_HOTEL_RATING = 3.5;
 const MIN_HOTEL_REVIEWS = 20;
 const MAX_POI_DIST_FROM_SAMPLE_KM = 15;
+const NEAR_DUP_KM = 0.35;
 /** 擴充的景點類型（古蹟、寺廟、步道、博物館、花園、遊樂園等） */
 const ATTRACTION_TYPES: PlaceType[] = [
   'tourist_attraction',
@@ -289,6 +290,8 @@ function isQualifiedPlace(p: any, type: PlaceType, distKm: number) {
 
   const name = String(p.name || '');
   if (/(gmbh|flagship|camping|hornbach|monteurzimmer)/i.test(name)) return false;
+  if (FOOD_TYPES.includes(type) && /(hotel|hostel|apartment|apartments|wohnung)/i.test(name)) return false;
+  if (type === 'place_of_worship' && !/(church|cathedral|temple|mosque|shrine|basilica|synagogue|kirche|dom)/i.test(name)) return false;
 
   const rating = Number(p.rating || 0);
   const reviews = Number(p.user_ratings_total || 0);
@@ -474,24 +477,34 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
 function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
   const itinerary: DaySlot[] = Array.from({ length: days }, () => ({ morning: [], afternoon: [] }));
   const idOf = (p: PlaceOut) => p.place_id || `${p.name}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
+  const normName = (s?: string) => (s || '').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
+  const similarAttraction = (a: PlaceOut, b: PlaceOut) => {
+    const na = normName(a.name), nb = normName(b.name);
+    const nameClose = na.length >= 5 && nb.length >= 5 && (na.includes(nb) || nb.includes(na));
+    const near = haversineKm({ lat: a.lat, lng: a.lng }, { lat: b.lat, lng: b.lng }) <= NEAR_DUP_KM;
+    return near && nameClose;
+  };
 
   const attractions = pois
     .filter(p => ATTRACTION_TYPES.includes(p._type as any))
     .sort((a, b) => (a.progress ?? 0) - (b.progress ?? 0) || (b.rating ?? 0) - (a.rating ?? 0));
-  const restaurants = pois.filter(p => FOOD_TYPES.includes(p._type as any));
+  const restaurants = pois
+    .filter(p => FOOD_TYPES.includes(p._type as any))
+    .filter(p => !/(hotel|hostel|apartment|apartments|wohnung)/i.test(p.name || ''));
   const hotels = pois.filter(p => HOTEL_TYPES.includes(p._type as any));
 
   const usedAttractions = new Set<string>();
   const usedRestaurants = new Set<string>();
   const usedHotels = new Set<string>();
 
-  const pickAttractions = (candidates: PlaceOut[], need: number, dayPicked: Set<string>) => {
+  const pickAttractions = (candidates: PlaceOut[], need: number, dayPicked: Set<string>, dayItems: PlaceOut[]) => {
     const out: PlaceOut[] = [];
 
     for (const p of candidates) {
       if (out.length >= need) break;
       const id = idOf(p);
       if (dayPicked.has(id) || usedAttractions.has(id)) continue;
+      if (dayItems.some(x => similarAttraction(x, p))) continue;
       out.push(p);
       dayPicked.add(id);
       usedAttractions.add(id);
@@ -501,6 +514,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       if (out.length >= need) break;
       const id = idOf(p);
       if (dayPicked.has(id)) continue;
+      if (dayItems.some(x => similarAttraction(x, p))) continue;
       out.push(p);
       dayPicked.add(id);
     }
@@ -517,8 +531,20 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
     const pool = bucket.length ? bucket : attractions;
 
     const dayPicked = new Set<string>();
-    itinerary[d].morning = pickAttractions(pool, 2, dayPicked);
-    itinerary[d].afternoon = pickAttractions(pool, 2, dayPicked);
+    itinerary[d].morning = pickAttractions(pool, 2, dayPicked, []);
+    if (itinerary[d].morning.length < 2) {
+      itinerary[d].morning = itinerary[d].morning.concat(
+        pickAttractions(attractions, 2 - itinerary[d].morning.length, dayPicked, itinerary[d].morning)
+      );
+    }
+
+    itinerary[d].afternoon = pickAttractions(pool, 2, dayPicked, itinerary[d].morning);
+    if (itinerary[d].afternoon.length < 2) {
+      const dayItems = [...itinerary[d].morning, ...itinerary[d].afternoon];
+      itinerary[d].afternoon = itinerary[d].afternoon.concat(
+        pickAttractions(attractions, 2 - itinerary[d].afternoon.length, dayPicked, dayItems)
+      );
+    }
 
     const pts = [...itinerary[d].morning, ...itinerary[d].afternoon];
     if (pts.length) {

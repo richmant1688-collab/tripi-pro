@@ -60,6 +60,15 @@ const ATTRACTION_KEYWORD_LIMIT = 1;
 const MAX_RESPONSE_POIS = 40;
 const MAX_RESPONSE_POLYLINE_POINTS = 120;
 const LONG_HAUL_KM = 1200;
+const LONG_HAUL_LOCAL_LAT_SPAN = 0.03;
+const LONG_HAUL_LOCAL_LNG_SPAN = 0.02;
+const MIN_ATTRACTION_RATING = 3.8;
+const MIN_ATTRACTION_REVIEWS = 40;
+const MIN_FOOD_RATING = 3.8;
+const MIN_FOOD_REVIEWS = 30;
+const MIN_HOTEL_RATING = 3.5;
+const MIN_HOTEL_REVIEWS = 20;
+const MAX_POI_DIST_FROM_SAMPLE_KM = 15;
 /** 擴充的景點類型（古蹟、寺廟、步道、博物館、花園、遊樂園等） */
 const ATTRACTION_TYPES: PlaceType[] = [
   'tourist_attraction',
@@ -273,6 +282,29 @@ function scorePlace(p: any, distKm?: number) {
   return rating * pop * proximity;
 }
 
+function isQualifiedPlace(p: any, type: PlaceType, distKm: number) {
+  if (!p || !p.geometry?.location) return false;
+  if (p.business_status && p.business_status !== 'OPERATIONAL') return false;
+  if (distKm > MAX_POI_DIST_FROM_SAMPLE_KM) return false;
+
+  const name = String(p.name || '');
+  if (/(gmbh|flagship|camping|hornbach|monteurzimmer)/i.test(name)) return false;
+
+  const rating = Number(p.rating || 0);
+  const reviews = Number(p.user_ratings_total || 0);
+
+  if (ATTRACTION_TYPES.includes(type)) {
+    return rating >= MIN_ATTRACTION_RATING && reviews >= MIN_ATTRACTION_REVIEWS;
+  }
+  if (FOOD_TYPES.includes(type)) {
+    return rating >= MIN_FOOD_RATING && reviews >= MIN_FOOD_REVIEWS;
+  }
+  if (HOTEL_TYPES.includes(type)) {
+    return rating >= MIN_HOTEL_RATING && reviews >= MIN_HOTEL_REVIEWS;
+  }
+  return true;
+}
+
 async function nearbyRaw(center: LatLng, radiusM: number, params: Record<string, string>) {
   const key = process.env.GOOGLE_MAPS_API_KEY!;
   const usp = new URLSearchParams({
@@ -370,7 +402,9 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
       const id = p.place_id as string | undefined;
       if (!id || !p.geometry?.location) continue;
       const point = { lat: p.geometry.location.lat, lng: p.geometry.location.lng };
-      const sc = scorePlace(p, haversineKm(sample, point)) * boost;
+      const distKm = haversineKm(sample, point);
+      if (!isQualifiedPlace(p, type, distKm)) continue;
+      const sc = scorePlace(p, distKm) * boost;
       const item = asPlaceOut(p, type, progressOf(point));
       if (!item) continue;
       const cur = byId.get(id);
@@ -653,9 +687,11 @@ function slimPoisForResponse(pois: PlaceOut[], itinerary: DaySlot[], limit = MAX
 }
 
 function buildDestinationLocalPath(center: LatLng): LatLng[] {
-  const lat2 = Math.max(-85, Math.min(85, center.lat + (center.lat >= 0 ? 0.18 : -0.18)));
-  const lng2 = center.lng + 0.12;
-  return [center, { lat: lat2, lng: lng2 }];
+  const latA = Math.max(-85, Math.min(85, center.lat + LONG_HAUL_LOCAL_LAT_SPAN));
+  const lngA = center.lng + LONG_HAUL_LOCAL_LNG_SPAN;
+  const latB = Math.max(-85, Math.min(85, center.lat - LONG_HAUL_LOCAL_LAT_SPAN * 0.7));
+  const lngB = center.lng + LONG_HAUL_LOCAL_LNG_SPAN * 1.2;
+  return [center, { lat: latA, lng: lngA }, { lat: latB, lng: lngB }];
 }
 
 function formatLongHaulDurationText(distanceKm: number) {
@@ -718,8 +754,10 @@ export async function POST(req: NextRequest) {
           const startLL = { lat: o.lat, lng: o.lng };
           const endLL = { lat: d.lat, lng: d.lng };
           const distanceKm = haversineKm(startLL, endLL);
+          const localPath = buildDestinationLocalPath(endLL);
           r = {
-            polyPts: [startLL, endLL],
+            // Keep route visualization local to destination for cross-country planning.
+            polyPts: localPath,
             start: { lat: startLL.lat, lng: startLL.lng, address: o.formatted_address || origin },
             end: { lat: endLL.lat, lng: endLL.lng, address: d.formatted_address || destination },
             distanceText: `${distanceKm.toFixed(0)} km`,

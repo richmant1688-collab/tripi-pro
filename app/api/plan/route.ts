@@ -394,6 +394,20 @@ function scorePlace(p: any, distKm?: number) {
   return rating * pop * proximity;
 }
 
+function canonicalPlaceType(p: any, fallback: PlaceType): PlaceType {
+  const types: string[] = Array.isArray(p?.types) ? p.types : [];
+  if (types.includes('lodging')) return 'lodging';
+  if (types.includes('restaurant') || types.includes('food') || types.includes('cafe') || types.includes('meal_takeaway')) return 'restaurant';
+  if (types.includes('museum') || types.includes('art_gallery')) return 'museum';
+  if (types.includes('aquarium')) return 'aquarium';
+  if (types.includes('zoo')) return 'zoo';
+  if (types.includes('amusement_park')) return 'amusement_park';
+  if (types.includes('park')) return 'park';
+  if (types.includes('place_of_worship') || types.includes('church') || types.includes('hindu_temple') || types.includes('mosque') || types.includes('synagogue')) return 'place_of_worship';
+  if (types.includes('tourist_attraction')) return 'tourist_attraction';
+  return fallback;
+}
+
 function hasAnyGoogleType(p: any, allow: Set<string>) {
   if (!Array.isArray(p?.types)) return false;
   return p.types.some((t: string) => allow.has(t));
@@ -404,35 +418,36 @@ function isQualifiedPlace(p: any, type: PlaceType, distKm: number) {
   if (p.business_status && p.business_status !== 'OPERATIONAL') return false;
   if (distKm > MAX_POI_DIST_FROM_SAMPLE_KM) return false;
 
+  const effectiveType = canonicalPlaceType(p, type);
   const name = String(p.name || '');
   const types: string[] = Array.isArray(p.types) ? p.types : [];
   const primaryType = types[0];
-  if (ATTRACTION_TYPES.includes(type) && ATTRACTION_NAME_BLOCKLIST.test(name)) return false;
+  if (ATTRACTION_TYPES.includes(effectiveType) && ATTRACTION_NAME_BLOCKLIST.test(name)) return false;
   if (/(gmbh|flagship|camping|hornbach|monteurzimmer)/i.test(name)) return false;
-  if (FOOD_TYPES.includes(type) && FOOD_NAME_BLOCKLIST.test(name)) return false;
-  if (FOOD_TYPES.includes(type) && HOTEL_BRAND_IN_FOOD_BLOCKLIST.test(name)) return false;
-  if (type === 'place_of_worship' && !/(church|cathedral|temple|mosque|shrine|basilica|synagogue|kirche|dom)/i.test(name)) return false;
+  if (FOOD_TYPES.includes(effectiveType) && FOOD_NAME_BLOCKLIST.test(name)) return false;
+  if (FOOD_TYPES.includes(effectiveType) && HOTEL_BRAND_IN_FOOD_BLOCKLIST.test(name)) return false;
+  if (effectiveType === 'place_of_worship' && !/(church|cathedral|temple|mosque|shrine|basilica|synagogue|kirche|dom)/i.test(name)) return false;
 
   const rating = Number(p.rating || 0);
   const reviews = Number(p.user_ratings_total || 0);
 
-  if (ATTRACTION_TYPES.includes(type)) {
+  if (ATTRACTION_TYPES.includes(effectiveType)) {
     if (!hasAnyGoogleType(p, ATTRACTION_TYPE_WHITELIST)) return false;
     if (primaryType && ATTRACTION_BAD_PRIMARY_TYPES.has(primaryType)) return false;
-    if (type === 'park' && PARK_NAME_BLOCKLIST.test(name)) return false;
-    if (type === 'park' && reviews < MIN_PARK_REVIEWS) return false;
-    if (type === 'museum' && reviews < MIN_MUSEUM_REVIEWS) return false;
-    if (type === 'zoo' && ZOO_NAME_BLOCKLIST.test(name)) return false;
-    if (type === 'zoo' && reviews < MIN_ZOO_REVIEWS) return false;
+    if (effectiveType === 'park' && PARK_NAME_BLOCKLIST.test(name)) return false;
+    if (effectiveType === 'park' && reviews < MIN_PARK_REVIEWS) return false;
+    if (effectiveType === 'museum' && reviews < MIN_MUSEUM_REVIEWS) return false;
+    if (effectiveType === 'zoo' && ZOO_NAME_BLOCKLIST.test(name)) return false;
+    if (effectiveType === 'zoo' && reviews < MIN_ZOO_REVIEWS) return false;
     if (!ATTRACTION_PRIORITY_NAME.test(name) && reviews < 120) return false;
     return rating >= MIN_ATTRACTION_RATING && reviews >= MIN_ATTRACTION_REVIEWS;
   }
-  if (FOOD_TYPES.includes(type)) {
+  if (FOOD_TYPES.includes(effectiveType)) {
     if (!hasAnyGoogleType(p, FOOD_TYPE_WHITELIST)) return false;
     if (types.includes('lodging')) return false;
     return rating >= MIN_FOOD_RATING && reviews >= MIN_FOOD_REVIEWS;
   }
-  if (HOTEL_TYPES.includes(type)) {
+  if (HOTEL_TYPES.includes(effectiveType)) {
     if (!types.includes('lodging')) return false;
     return rating >= MIN_HOTEL_RATING && reviews >= MIN_HOTEL_REVIEWS;
   }
@@ -488,6 +503,7 @@ async function nearby(center: LatLng, type?: PlaceType, radiusM?: number, keywor
 function asPlaceOut(result: any, type: PlaceType, progress?: number): PlaceOut | undefined {
   if (!result || !result.geometry?.location) return;
   const loc = result.geometry.location;
+  const normalizedType = canonicalPlaceType(result, type);
   const o: PlaceOut = {
     name: result.name,
     lat: loc.lat,
@@ -496,7 +512,7 @@ function asPlaceOut(result: any, type: PlaceType, progress?: number): PlaceOut |
     rating: result.rating,
     user_ratings_total: result.user_ratings_total,
     place_id: result.place_id,
-    _type: type,
+    _type: normalizedType,
     progress,
   };
   return o;
@@ -622,10 +638,12 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
   const idOf = (p: PlaceOut) => p.place_id || `${p.name}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
   const normName = (s?: string) => (s || '').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
   const attractionGroupKey = (p: PlaceOut) => {
-    const n = normName(p.name)
+    const baseName = normName(p.name)
+      .replace(/美景宮下宮|美景宮上宮|美景宮|lowerbelvedere|upperbelvedere|unteresbelvedere|oberesbelvedere|belvedere/g, 'belvedere');
+    const n = baseName
       .replace(/博物館|美術館|花園|公園|教堂|廣場|城堡|景點|雕像/g, '')
       .replace(/museum|gallery|park|garden|cathedral|church|palace|schloss|platz|vienna|wien/g, '');
-    return n.slice(0, 12) || normName(p.name).slice(0, 12);
+    return n.slice(0, 12) || baseName.slice(0, 12);
   };
   const similarAttraction = (a: PlaceOut, b: PlaceOut) => {
     const na = normName(a.name), nb = normName(b.name);

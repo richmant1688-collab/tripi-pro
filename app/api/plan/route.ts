@@ -48,7 +48,15 @@ type DirectionsInfo = {
 const LANG = 'zh-TW';
 const COUNTRY_REGION = 'tw';
 const NEAR_EQ_KM = 3;
-
+const SAMPLE_MIN = 6;
+const SAMPLE_MAX = 14;
+const SAMPLE_SEGMENT_KM = 45;
+const SAMPLE_DEDUP_KM = 5;
+const NEARBY_CONCURRENCY = 6;
+const REVERSE_GEOCODE_CONCURRENCY = 4;
+const NEARBY_RETRY_LIMIT = 3;
+const NEARBY_TIMEOUT_MS = 6000;
+const ATTRACTION_KEYWORD_LIMIT = 1;
 /** 擴充的景點類型（古蹟、寺廟、步道、博物館、花園、遊樂園等） */
 const ATTRACTION_TYPES: PlaceType[] = [
   'tourist_attraction',
@@ -71,6 +79,22 @@ const ATTRACTION_CN_KEYWORDS = [
 
 /** ---------------- Utils ---------------- */
 function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
+
+async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, limit: number): Promise<T[]> {
+  if (!tasks.length) return [];
+  const safeLimit = Math.max(1, Math.min(limit, tasks.length));
+  const out: T[] = new Array(tasks.length);
+  let next = 0;
+  const workers = Array.from({ length: safeLimit }, async () => {
+    while (true) {
+      const idx = next++;
+      if (idx >= tasks.length) break;
+      out[idx] = await tasks[idx]();
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
 
 async function fetchJson<T = any>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, { cache: 'no-store', ...init });
@@ -99,12 +123,10 @@ function sampleAlongPathDynamic(path: LatLng[]) {
   if (!path.length) return [];
   const cum = cumulativeLengthKm(path);
   const total = cum[cum.length - 1];
-  const minN = 8;
-  const maxN = 24;
-  const n = Math.max(minN, Math.min(maxN, Math.ceil(total / 30) + 8));
+  const n = Math.max(SAMPLE_MIN, Math.min(SAMPLE_MAX, Math.ceil(total / SAMPLE_SEGMENT_KM) + SAMPLE_MIN));
   const positions: LatLng[] = [];
   for (let i = 0; i < n; i++) {
-    const target = (i / (n - 1)) * total;
+    const target = (i / Math.max(1, n - 1)) * total;
     let j = 0;
     while (j < cum.length && cum[j] < target) j++;
     if (j === 0) positions.push(path[0]);
@@ -116,13 +138,12 @@ function sampleAlongPathDynamic(path: LatLng[]) {
       positions.push({ lat: A.lat + (B.lat - A.lat) * r, lng: A.lng + (B.lng - A.lng) * r });
     }
   }
-  // 去重（小於 3km 的點視為重複）
   const dedup: LatLng[] = [];
-  for (const p of positions) if (!dedup.some(q => haversineKm(p, q) < 3)) dedup.push(p);
+  for (const p of positions) {
+    if (!dedup.some(q => haversineKm(p, q) < SAMPLE_DEDUP_KM)) dedup.push(p);
+  }
   return dedup;
 }
-
-/** 依全程距離調整半徑（往南擴大搜尋，上限 15km，控制請求量） */
 function dynamicRadiusMeters(totalKm: number) {
   const base = Math.min(15000, Math.max(4000, Math.round(totalKm * 20)));
   return base;
@@ -247,15 +268,37 @@ async function nearbyRaw(center: LatLng, radiusM: number, params: Record<string,
     radius: `${radiusM}`,
     language: LANG,
     key,
-      });
+  });
   for (const [k, v] of Object.entries(params)) usp.set(k, v);
   const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?${usp.toString()}`;
-  const j = await fetchJson<any>(url);
-  if (j.status && j.status !== 'OK' && j.status !== 'ZERO_RESULTS') return [];
-  return Array.isArray(j.results) ? j.results : [];
-}
 
-/** 一般 nearby：可帶 type 或 keyword（兩者合用） */
+  for (let attempt = 0; attempt < NEARBY_RETRY_LIMIT; attempt++) {
+    try {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), NEARBY_TIMEOUT_MS);
+      const j = await fetchJson<any>(url, { signal: ac.signal });
+      clearTimeout(timer);
+
+      if (j.status === 'OK' || j.status === 'ZERO_RESULTS') {
+        return Array.isArray(j.results) ? j.results : [];
+      }
+
+      const retryable = j.status === 'OVER_QUERY_LIMIT' || j.status === 'UNKNOWN_ERROR';
+      if (retryable && attempt < NEARBY_RETRY_LIMIT - 1) {
+        await sleep(200 * (attempt + 1));
+        continue;
+      }
+      return [];
+    } catch {
+      if (attempt < NEARBY_RETRY_LIMIT - 1) {
+        await sleep(200 * (attempt + 1));
+        continue;
+      }
+      return [];
+    }
+  }
+  return [];
+}
 async function nearby(center: LatLng, type?: PlaceType, radiusM?: number, keyword?: string) {
   const params: Record<string, string> = {};
   if (type) params['type'] = type;
@@ -287,15 +330,22 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
   const totalKm = haversineKm(path[0], path[path.length - 1]);
   const radius = dynamicRadiusMeters(totalKm);
 
-  // 建立即時查找映射，將每個 POI 綁上「路線進度」
   const cum = cumulativeLengthKm(path);
   const total = cum[cum.length - 1];
+  const stride = Math.max(1, Math.floor(path.length / 220));
+  const lookupIdx: number[] = [];
+  for (let i = 0; i < path.length; i += stride) lookupIdx.push(i);
+  if (lookupIdx[lookupIdx.length - 1] !== path.length - 1) lookupIdx.push(path.length - 1);
+
   const progressOf = (pt: LatLng) => {
     let best = Infinity;
     let bestIdx = 0;
-    for (let i = 0; i < path.length; i++) {
-      const d = haversineKm(pt, path[i]);
-      if (d < best) { best = d; bestIdx = i; }
+    for (const idx of lookupIdx) {
+      const d = haversineKm(pt, path[idx]);
+      if (d < best) {
+        best = d;
+        bestIdx = idx;
+      }
     }
     const prog = cum[bestIdx] / (total || 1);
     return Math.max(0, Math.min(1, prog));
@@ -303,75 +353,68 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
 
   const byId = new Map<string, { item: PlaceOut; score: number }>();
 
-  // 1) Attractions（中文關鍵字強化：只挑 2 個，降低請求量）
-  for (const s of samples) {
+  const ingest = (arr: any[], type: PlaceType, sample: LatLng, boost = 1) => {
+    for (const p of arr) {
+      const id = p.place_id as string | undefined;
+      if (!id || !p.geometry?.location) continue;
+      const point = { lat: p.geometry.location.lat, lng: p.geometry.location.lng };
+      const sc = scorePlace(p, haversineKm(sample, point)) * boost;
+      const item = asPlaceOut(p, type, progressOf(point));
+      if (!item) continue;
+      const cur = byId.get(id);
+      if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
+    }
+  };
+
+  const tasks: Array<() => Promise<void>> = [];
+
+  for (let si = 0; si < samples.length; si++) {
+    const s = samples[si];
     for (const t of ATTRACTION_TYPES) {
-      const arr = await nearby(s, t, radius);
-      for (const p of arr) {
-        const id = p.place_id as string | undefined; if (!id) continue;
-        const sc = scorePlace(p, haversineKm(s, { lat: p.geometry.location.lat, lng: p.geometry.location.lng }));
-        const item = asPlaceOut(p, t, progressOf({ lat: p.geometry.location.lat, lng: p.geometry.location.lng }));
-        if (!item) continue;
-        const cur = byId.get(id);
-        if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
-      }
-      await sleep(35);
-      for (const kw of ATTRACTION_CN_KEYWORDS.slice(0, 2)) {
-        const arr2 = await nearby(s, t, Math.round(radius * 0.8), kw);
-        for (const p of arr2) {
-          const id = p.place_id as string | undefined; if (!id) continue;
-          const sc = scorePlace(p, haversineKm(s, { lat: p.geometry.location.lat, lng: p.geometry.location.lng })) * 1.05;
-          const item = asPlaceOut(p, t, progressOf({ lat: p.geometry.location.lat, lng: p.geometry.location.lng }));
-          if (!item) continue;
-          const cur = byId.get(id);
-          if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
+      tasks.push(async () => {
+        const arr = await nearby(s, t, radius);
+        ingest(arr, t, s);
+      });
+
+      if (si % 2 === 0) {
+        for (const kw of ATTRACTION_CN_KEYWORDS.slice(0, ATTRACTION_KEYWORD_LIMIT)) {
+          tasks.push(async () => {
+            const arr2 = await nearby(s, t, Math.round(radius * 0.8), kw);
+            ingest(arr2, t, s, 1.05);
+          });
         }
-        await sleep(30);
       }
     }
   }
 
-  // 2) Restaurants
   for (const s of samples) {
     for (const t of FOOD_TYPES) {
-      const arr = await nearby(s, t, Math.max(3000, Math.round(radius * 0.5)));
-      for (const p of arr) {
-        const id = p.place_id as string | undefined; if (!id) continue;
-        const sc = scorePlace(p, haversineKm(s, { lat: p.geometry.location.lat, lng: p.geometry.location.lng }));
-        const item = asPlaceOut(p, t, progressOf({ lat: p.geometry.location.lat, lng: p.geometry.location.lng }));
-        if (!item) continue;
-        const cur = byId.get(id);
-        if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
-      }
-      await sleep(25);
+      tasks.push(async () => {
+        const arr = await nearby(s, t, Math.max(3000, Math.round(radius * 0.5)));
+        ingest(arr, t, s);
+      });
     }
   }
 
-  // 3) Hotels
   for (const s of samples) {
     for (const t of HOTEL_TYPES) {
-      const arr = await nearby(s, t, Math.max(5000, Math.round(radius * 0.6)));
-      for (const p of arr) {
-        const id = p.place_id as string | undefined; if (!id) continue;
-        const sc = scorePlace(p, haversineKm(s, { lat: p.geometry.location.lat, lng: p.geometry.location.lng }));
-        const item = asPlaceOut(p, t, progressOf({ lat: p.geometry.location.lat, lng: p.geometry.location.lng }));
-        if (!item) continue;
-        const cur = byId.get(id);
-        if (!cur || sc > cur.score) byId.set(id, { item, score: sc });
-      }
-      await sleep(25);
+      tasks.push(async () => {
+        const arr = await nearby(s, t, Math.max(5000, Math.round(radius * 0.6)));
+        ingest(arr, t, s);
+      });
     }
   }
 
-  // 依「沿路前進進度」排序，若相同就用分數
+  await runWithConcurrency(tasks, NEARBY_CONCURRENCY);
+
   const pois = Array.from(byId.values())
     .sort((a, b) => {
-      const pa = a.item.progress ?? 0, pb = b.item.progress ?? 0;
+      const pa = a.item.progress ?? 0;
+      const pb = b.item.progress ?? 0;
       return pa - pb || b.score - a.score;
     })
     .map(x => x.item);
 
-  // 去重 by name+address 開頭
   const seen = new Set<string>();
   const clean: PlaceOut[] = [];
   for (const p of pois) {
@@ -382,8 +425,6 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
   }
   return clean;
 }
-
-/** 使用「進度切片」分配每日景點，且上午/下午各 >= 2 個 */
 function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
   const itinerary: DaySlot[] = Array.from({ length: days }, () => ({ morning: [], afternoon: [] }));
 
@@ -479,21 +520,31 @@ async function enrichChosenPOIsWithCity(itinerary: DaySlot[], all: PlaceOut[]) {
   const idToPoi = new Map<string, PlaceOut>();
   for (const p of all) if (p.place_id) idToPoi.set(p.place_id, p);
 
-  for (const id of chosenIds) {
+  const geoCache = new Map<string, Promise<{ city?: string; district?: string; formatted: string }>>();
+  const reverseCached = (lat: number, lng: number) => {
+    const key = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+    const hit = geoCache.get(key);
+    if (hit) return hit;
+    const req = reverseGeocodeGoogle(lat, lng);
+    geoCache.set(key, req);
+    return req;
+  };
+
+  const tasks = Array.from(chosenIds).map(id => async () => {
     const p = idToPoi.get(id);
-    if (!p) continue;
+    if (!p) return;
     try {
-      const rev = await reverseGeocodeGoogle(p.lat, p.lng);
+      const rev = await reverseCached(p.lat, p.lng);
       p.city = rev.city;
       p.district = rev.district;
       p.address = formatAddressWithCity(p.address, rev.city, rev.district);
-      await sleep(30);
     } catch {
       if (p.address) p.address = p.address.trim();
     }
-  }
-}
+  });
 
+  await runWithConcurrency(tasks, REVERSE_GEOCODE_CONCURRENCY);
+}
 /** ---------------- OSM/OSRM fallback ---------------- */
 async function geocodeOSM(query: string) {
   const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&addressdetails=1`;

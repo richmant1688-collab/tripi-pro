@@ -31,10 +31,10 @@ type PlaceOut = {
 };
 
 type DaySlot = {
-  morning: PlaceOut[];   // 至少 2 個景點
-  lunch?: PlaceOut;      // 餐廳 1
-  afternoon: PlaceOut[]; // 至少 2 個景點
-  lodging?: PlaceOut;    // 住宿 1
+  morning: PlaceOut[];
+  lunch?: PlaceOut;
+  afternoon: PlaceOut[];
+  lodging?: PlaceOut;
 };
 
 type DirectionsInfo = {
@@ -57,6 +57,8 @@ const REVERSE_GEOCODE_CONCURRENCY = 4;
 const NEARBY_RETRY_LIMIT = 3;
 const NEARBY_TIMEOUT_MS = 6000;
 const ATTRACTION_KEYWORD_LIMIT = 1;
+const MAX_RESPONSE_POIS = 40;
+const MAX_RESPONSE_POLYLINE_POINTS = 120;
 /** 擴充的景點類型（古蹟、寺廟、步道、博物館、花園、遊樂園等） */
 const ATTRACTION_TYPES: PlaceType[] = [
   'tourist_attraction',
@@ -545,6 +547,71 @@ async function enrichChosenPOIsWithCity(itinerary: DaySlot[], all: PlaceOut[]) {
 
   await runWithConcurrency(tasks, REVERSE_GEOCODE_CONCURRENCY);
 }
+function toPolylineArray(path: LatLng[], maxPoints = MAX_RESPONSE_POLYLINE_POINTS): [number, number][] {
+  if (!path.length) return [];
+  if (path.length <= maxPoints) return path.map(({ lat, lng }) => [lat, lng] as [number, number]);
+
+  const out: [number, number][] = [];
+  const step = (path.length - 1) / (maxPoints - 1);
+  for (let i = 0; i < maxPoints; i++) {
+    const idx = Math.min(path.length - 1, Math.round(i * step));
+    const p = path[idx];
+    out.push([p.lat, p.lng]);
+  }
+  return out;
+}
+
+function compactPlaceForResponse(p: PlaceOut): PlaceOut {
+  return {
+    name: p.name,
+    lat: Number(p.lat.toFixed(6)),
+    lng: Number(p.lng.toFixed(6)),
+    address: p.address?.slice(0, 80),
+    rating: p.rating,
+    user_ratings_total: p.user_ratings_total,
+    place_id: p.place_id,
+    _type: p._type,
+    city: p.city,
+    district: p.district,
+    progress: typeof p.progress === 'number' ? Number(p.progress.toFixed(4)) : undefined,
+  };
+}
+
+function compactDaySlot(day: DaySlot): DaySlot {
+  return {
+    morning: day.morning.map(compactPlaceForResponse),
+    lunch: day.lunch ? compactPlaceForResponse(day.lunch) : undefined,
+    afternoon: day.afternoon.map(compactPlaceForResponse),
+    lodging: day.lodging ? compactPlaceForResponse(day.lodging) : undefined,
+  };
+}
+
+function slimPoisForResponse(pois: PlaceOut[], itinerary: DaySlot[], limit = MAX_RESPONSE_POIS): PlaceOut[] {
+  const keyOf = (p: PlaceOut) => p.place_id || `${p.name}@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
+  const picked = new Map<string, PlaceOut>();
+
+  for (const day of itinerary) {
+    for (const p of [...day.morning, day.lunch, ...day.afternoon, day.lodging]) {
+      if (!p) continue;
+      const k = keyOf(p);
+      if (!picked.has(k)) picked.set(k, p);
+    }
+  }
+
+  const out: PlaceOut[] = [];
+  for (const p of picked.values()) {
+    out.push(compactPlaceForResponse(p));
+    if (out.length >= limit) return out;
+  }
+
+  for (const p of pois) {
+    const k = keyOf(p);
+    if (picked.has(k)) continue;
+    out.push(compactPlaceForResponse(p));
+    if (out.length >= limit) break;
+  }
+  return out;
+}
 /** ---------------- OSM/OSRM fallback ---------------- */
 async function geocodeOSM(query: string) {
   const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&addressdetails=1`;
@@ -587,13 +654,11 @@ export async function POST(req: NextRequest) {
     const hasGoogle = !!process.env.GOOGLE_MAPS_API_KEY;
 
     if (hasGoogle) {
-      // 1) 路線 & 採樣
       const r = await directionsGoogle(origin, destination);
       const startLL = { lat: r.start.lat, lng: r.start.lng };
       const endLL = { lat: r.end.lat, lng: r.end.lng };
       const isSingle = haversineKm(startLL, endLL) <= NEAR_EQ_KM;
 
-      // 2) 採集 POIs
       let pois: PlaceOut[] = [];
       if (isSingle) {
         const fakePath = [startLL, { lat: startLL.lat - 0.5, lng: startLL.lng + 0.2 }];
@@ -602,30 +667,25 @@ export async function POST(req: NextRequest) {
         pois = await harvestPOIsAlongPath(r.polyPts);
       }
 
-      // 3) 產生每日行程（上午/下午各 >=2）
       const itinerary = buildAgencyStyleItinerary(pois, days);
-
-      // 4) 只對入選點做反向地理，並把縣市/行政區穩定前置（強制出現）
       await enrichChosenPOIsWithCity(itinerary, pois);
 
-    return NextResponse.json({
+      return NextResponse.json({
         provider: 'google',
-        polyline: r.polyPts.map(({ lat, lng }) => [lat, lng]) as [number, number][],
+        polyline: toPolylineArray(r.polyPts),
         start: { lat: r.start.lat, lng: r.start.lng, address: r.start.address },
         end: { lat: r.end.lat, lng: r.end.lng, address: r.end.address },
         distanceText: r.distanceText,
         durationText: r.durationText,
-        pois,
-        itinerary,
-    }, { headers: { 'Cache-Control': 'private, max-age=60' } });
-
+        pois: slimPoisForResponse(pois, itinerary),
+        itinerary: itinerary.map(compactDaySlot),
+      }, { headers: { 'Cache-Control': 'private, max-age=60' } });
     } else {
-      // 無 Google Key：用 OSM/OSRM 最小回傳（不含豐富 POI）
       const o = await geocodeOSM(origin), d = await geocodeOSM(destination);
       const ro = await routeOSRM({ lat: o.lat, lng: o.lng }, { lat: d.lat, lng: d.lng });
       return NextResponse.json({
         provider: 'osrm',
-        polyline: ro.polyPts.map(({ lat, lng }) => [lat, lng]) as [number, number][],
+        polyline: toPolylineArray(ro.polyPts),
         start: { lat: o.lat, lng: o.lng, address: o.formatted },
         end: { lat: d.lat, lng: d.lng, address: d.formatted },
         distanceText: ro.distanceText,

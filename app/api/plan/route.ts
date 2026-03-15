@@ -242,7 +242,7 @@ function formatAddressWithCity(address?: string, city?: string, district?: strin
   let rest = address ? clean(address) : '';
   const head = parts.join(' 繚 ');
 
-  // ?餅???銝脖葉撌脤?銴??嚗腦撣??嚗?  if (rest) {
+  if (rest) {
     const rmRaw = [city, district].filter(Boolean).join('|');
     if (rmRaw) {
       const rm = rmRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

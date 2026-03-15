@@ -294,24 +294,63 @@ async function geocodeGoogle(query: string) {
   throw new Error(`geocode_failed:${lastStatus}${lastErr ? ':' + lastErr : ''}`);
 }
 
-async function geocodeAny(query: string) {
-  try {
-    const g = await geocodeGoogle(query);
-    return {
-      lat: g.lat,
-      lng: g.lng,
-      formatted_address: g.formatted_address,
-      components: g.components || [],
-    };
-  } catch {
-    const o = await geocodeOSM(query);
-    return {
-      lat: o.lat,
-      lng: o.lng,
-      formatted_address: o.formatted,
-      components: [],
-    };
+function expandGeocodeQueries(input: string): string[] {
+  const q0 = String(input || '').trim();
+  const cleaned = q0
+    .replace(/[，。！？]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/(\d+\s*(天|日)|第\s*\d+\s*天|[一二三四五六七八九十]+\s*(天|日)|days?)/gi, ' ')
+    .replace(/(行程|旅遊|旅行|規劃|itinerary|trip|travel)/gi, ' ')
+    .trim();
+  const q1 = cleaned.replace(/\s*(到|to|->|→)\s*$/i, '').trim();
+  const q2 = q1.replace(/^(\s*從\s*|from\s+)/i, '').trim();
+
+  const alias: Record<string, string[]> = {
+    '台北': ['台北', '臺北', 'Taipei', 'Taipei City'],
+    '臺北': ['臺北', '台北', 'Taipei', 'Taipei City'],
+    '維也納': ['維也納', '维也纳', 'Vienna', 'Wien'],
+    '维也纳': ['维也纳', '維也納', 'Vienna', 'Wien'],
+  };
+
+  const out = new Set<string>();
+  for (const q of [q0, q1, q2]) {
+    if (!q) continue;
+    out.add(q);
+    if (alias[q]) alias[q].forEach(v => out.add(v));
   }
+  return Array.from(out);
+}
+
+async function geocodeAny(query: string) {
+  const variants = expandGeocodeQueries(query);
+  let lastErr: any;
+  for (const q of variants) {
+    try {
+      const g = await geocodeGoogle(q);
+      return {
+        lat: g.lat,
+        lng: g.lng,
+        formatted_address: g.formatted_address,
+        components: g.components || [],
+      };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  for (const q of variants) {
+    try {
+      const o = await geocodeOSM(q);
+      return {
+        lat: o.lat,
+        lng: o.lng,
+        formatted_address: o.formatted,
+        components: [],
+      };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('geocode_any_failed');
 }
 
 async function reverseGeocodeGoogle(lat: number, lng: number) {

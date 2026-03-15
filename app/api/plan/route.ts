@@ -76,7 +76,7 @@ const NEAR_DUP_KM = 0.35;
 const HARD_NEAR_DUP_KM = 0.18;
 const FOOD_NAME_BLOCKLIST = /(hotel|hostel|apartment|apartments|resort|inn|motel|wohnung|\u9152\u5e97|\u98ef\u5e97|\u65c5\u9928|\u65c5\u5e97|\u6c11\u5bbf)/i;
 const HOTEL_BRAND_IN_FOOD_BLOCKLIST = /(radisson|marriott|hilton|hyatt|intercontinental|holiday\s*inn|guesthouse|trend\s*hotel|trendhotel|wombat)/i;
-const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach)/i;
+const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach|zoo\s*scharf|michael\s*scharf)/i;
 const PARK_NAME_BLOCKLIST = /(hundezone|dog\s*park|skate|parkplatz|parking)/i;
 const ZOO_NAME_BLOCKLIST = /(pet\s*shop|tierhandlung|aquaristik|zoo\s*shop|handlung|store|zoo\s*scharf|\/)/i;
 const ATTRACTION_TYPE_WHITELIST = new Set([
@@ -566,15 +566,31 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
   const attractions = pois
     .filter(p => ATTRACTION_TYPES.includes(p._type as any))
     .sort((a, b) => (a.progress ?? 0) - (b.progress ?? 0) || (b.rating ?? 0) - (a.rating ?? 0));
-  const restaurants = pois
+  const restaurantKey = (p: PlaceOut) => {
+    const core = normName(p.name)
+      .replace(/restaurant|cafe|bar|brau|br\u00E4u|wien|vienna|\u9910\u5ef3|\u5496\u5561/g, '')
+      .slice(0, 16) || normName(p.name).slice(0, 16);
+    return `${core}@${p.lat.toFixed(3)},${p.lng.toFixed(3)}`;
+  };
+  const restaurantsRaw = pois
     .filter(p => FOOD_TYPES.includes(p._type as any))
     .filter(p => !FOOD_NAME_BLOCKLIST.test(p.name || ''));
+  const restaurants = (() => {
+    const sorted = [...restaurantsRaw].sort((a, b) => (b.rating || 0) - (a.rating || 0));
+    const m = new Map<string, PlaceOut>();
+    for (const r of sorted) {
+      const k = restaurantKey(r);
+      if (!m.has(k)) m.set(k, r);
+    }
+    return Array.from(m.values());
+  })();
   const hotels = pois.filter(p => HOTEL_TYPES.includes(p._type as any));
   const allowCrossDayRepeat = attractions.length < days * 2;
 
   const usedAttractions = new Set<string>();
   const usedAttractionSpots: PlaceOut[] = [];
   const usedRestaurants = new Set<string>();
+  const usedRestaurantKeys = new Set<string>();
   const usedHotels = new Set<string>();
 
   const pickAttractions = (candidates: PlaceOut[], need: number, dayPicked: Set<string>, dayItems: PlaceOut[]) => {
@@ -640,7 +656,9 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
 
       for (const r of restaurants) {
         const id = idOf(r);
+        const key = restaurantKey(r);
         if (usedRestaurants.has(id)) continue;
+        if (usedRestaurantKeys.has(key)) continue;
         const distKm = haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng });
         if (distKm > 6) continue;
         const sc = (r.rating || 0) / (1 + distKm / 6);
@@ -652,7 +670,9 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       if (!bestR) {
         for (const r of restaurants) {
           const id = idOf(r);
+          const key = restaurantKey(r);
           if (usedRestaurants.has(id)) continue;
+          if (usedRestaurantKeys.has(key)) continue;
           const sc = (r.rating || 0) / (1 + haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) / 6);
           if (sc > bestScore) {
             bestScore = sc;
@@ -663,6 +683,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       if (bestR) {
         itinerary[d].lunch = bestR;
         usedRestaurants.add(idOf(bestR));
+        usedRestaurantKeys.add(restaurantKey(bestR));
       }
     }
 

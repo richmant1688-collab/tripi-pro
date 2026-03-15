@@ -77,7 +77,7 @@ const HARD_NEAR_DUP_KM = 0.18;
 const MAX_ITINERARY_LEG_KM = 3.5;
 const FOOD_NAME_BLOCKLIST = /(hotel|hostel|apartment|apartments|resort|inn|motel|wohnung|\u9152\u5e97|\u98ef\u5e97|\u65c5\u9928|\u65c5\u5e97|\u6c11\u5bbf)/i;
 const HOTEL_BRAND_IN_FOOD_BLOCKLIST = /(radisson|marriott|hilton|hyatt|intercontinental|holiday\s*inn|guesthouse|trend\s*hotel|trendhotel|wombat)/i;
-const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach|zoo\s*scharf|michael\s*scharf)/i;
+const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach|zoo\s*scharf|michael\s*scharf|\bwuk\b|bo-yo|chocolate\s*museum)/i;
 const PARK_NAME_BLOCKLIST = /(hundezone|dog\s*park|skate|parkplatz|parking)/i;
 const ZOO_NAME_BLOCKLIST = /(pet\s*shop|tierhandlung|aquaristik|zoo\s*shop|handlung|store|zoo\s*scharf|\/)/i;
 const ATTRACTION_PRIORITY_NAME = /(museum|gallery|cathedral|church|palace|castle|historic|old\s*town|monument|opera|hofburg|stephans|belvedere|park|garden|platz|博物館|美術館|教堂|主教座堂|皇宮|宮|城堡|紀念|廣場|公園)/i;
@@ -765,6 +765,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
     let bestScore = -1;
     for (const p of attractions) {
       if (isBadAttractionName(p.name)) continue;
+      if (usedAttractionGroupFinal.has(attractionGroupKey(p))) continue;
       if (deny.some(x => similarAttraction(x, p))) continue;
       const dist = legKm(anchor, p);
       if (dist <= 0 || dist > MAX_ITINERARY_LEG_KM) continue;

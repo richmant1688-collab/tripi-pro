@@ -388,6 +388,16 @@ function resolveKnownCity(query: string): { lat: number; lng: number; formatted_
   return null;
 }
 
+async function geocodeWithFallback(query: string, lang: string, region: string) {
+  try {
+    return await geocodeAny(query, lang, region);
+  } catch (e) {
+    const known = resolveKnownCity(query);
+    if (known) return known;
+    throw e;
+  }
+}
+
 async function geocodeAny(query: string, lang: string, region: string) {
   const variants = expandGeocodeQueries(query);
   let lastErr: any;
@@ -1277,27 +1287,33 @@ export async function POST(req: NextRequest) {
       let r: DirectionsInfo;
       let longHaulFallback = false;
       const sameToken = normalizeLocationToken(origin) === normalizeLocationToken(destination);
+      const knownOrigin = resolveKnownCity(origin);
+      const knownDestination = resolveKnownCity(destination);
       let resolvedOrigin: { lat: number; lng: number; formatted_address?: string } | null = null;
       let resolvedDestination: { lat: number; lng: number; formatted_address?: string } | null = null;
       let destinationPoisForTail: PlaceOut[] = [];
 
-      if (!sameToken) {
+      if (!sameToken && knownOrigin && knownDestination) {
+        const knownCrow = haversineKm(
+          { lat: knownOrigin.lat, lng: knownOrigin.lng },
+          { lat: knownDestination.lat, lng: knownDestination.lng },
+        );
+        if (knownCrow >= INTERCITY_SUPPLEMENT_KM) {
+          resolvedOrigin = knownOrigin;
+          resolvedDestination = knownDestination;
+        }
+      }
+
+      if (!sameToken && !(resolvedOrigin && resolvedDestination)) {
         try {
           const [oGeo, dGeo] = await Promise.all([
-            geocodeAny(origin, locale.lang, routingRegion),
-            geocodeAny(destination, locale.lang, routingRegion),
+            geocodeWithFallback(origin, locale.lang, routingRegion),
+            geocodeWithFallback(destination, locale.lang, routingRegion),
           ]);
-          let oFix = { lat: oGeo.lat, lng: oGeo.lng, formatted_address: oGeo.formatted_address };
-          let dFix = { lat: dGeo.lat, lng: dGeo.lng, formatted_address: dGeo.formatted_address };
-          const knownOrigin = resolveKnownCity(origin);
-          const knownDestination = resolveKnownCity(destination);
-          if (knownOrigin) oFix = knownOrigin;
-          if (knownDestination) dFix = knownDestination;
-
-          const preCrow = haversineKm({ lat: oFix.lat, lng: oFix.lng }, { lat: dFix.lat, lng: dFix.lng });
+          const preCrow = haversineKm({ lat: oGeo.lat, lng: oGeo.lng }, { lat: dGeo.lat, lng: dGeo.lng });
           if (preCrow >= INTERCITY_SUPPLEMENT_KM) {
-            resolvedOrigin = oFix;
-            resolvedDestination = dFix;
+            resolvedOrigin = oGeo;
+            resolvedDestination = dGeo;
           }
         } catch {
           // Keep text-based routing if pre-geocoding is unavailable.
@@ -1321,8 +1337,8 @@ export async function POST(req: NextRequest) {
           );
           if (rawCrow < INTERCITY_SUPPLEMENT_KM) {
             try {
-              const oGeo = await geocodeAny(origin, locale.lang, routingRegion);
-              const dGeo = await geocodeAny(destination, locale.lang, routingRegion);
+              const oGeo = await geocodeWithFallback(origin, locale.lang, routingRegion);
+              const dGeo = await geocodeWithFallback(destination, locale.lang, routingRegion);
               const geoCrow = haversineKm(
                 { lat: oGeo.lat, lng: oGeo.lng },
                 { lat: dGeo.lat, lng: dGeo.lng },
@@ -1347,8 +1363,8 @@ export async function POST(req: NextRequest) {
       } catch (e: any) {
         const code = e?.code || e?.message;
         if (code === 'ZERO_RESULTS' || code === 'NOT_FOUND' || code === 'REQUEST_DENIED' || code === 'INVALID_REQUEST' || code === 'OVER_DAILY_LIMIT') {
-          const o = resolvedOrigin || await geocodeAny(origin, locale.lang, routingRegion);
-          const d = resolvedDestination || await geocodeAny(destination, locale.lang, routingRegion);
+          const o = resolvedOrigin || await geocodeWithFallback(origin, locale.lang, routingRegion);
+          const d = resolvedDestination || await geocodeWithFallback(destination, locale.lang, routingRegion);
           const startLL = { lat: o.lat, lng: o.lng };
           const endLL = { lat: d.lat, lng: d.lng };
           const distanceKm = haversineKm(startLL, endLL);

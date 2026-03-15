@@ -74,11 +74,14 @@ const MIN_ZOO_REVIEWS = 200;
 const MAX_POI_DIST_FROM_SAMPLE_KM = 15;
 const NEAR_DUP_KM = 0.35;
 const HARD_NEAR_DUP_KM = 0.18;
+const MAX_ITINERARY_LEG_KM = 3.5;
 const FOOD_NAME_BLOCKLIST = /(hotel|hostel|apartment|apartments|resort|inn|motel|wohnung|\u9152\u5e97|\u98ef\u5e97|\u65c5\u9928|\u65c5\u5e97|\u6c11\u5bbf)/i;
 const HOTEL_BRAND_IN_FOOD_BLOCKLIST = /(radisson|marriott|hilton|hyatt|intercontinental|holiday\s*inn|guesthouse|trend\s*hotel|trendhotel|wombat)/i;
 const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach|zoo\s*scharf|michael\s*scharf)/i;
 const PARK_NAME_BLOCKLIST = /(hundezone|dog\s*park|skate|parkplatz|parking)/i;
 const ZOO_NAME_BLOCKLIST = /(pet\s*shop|tierhandlung|aquaristik|zoo\s*shop|handlung|store|zoo\s*scharf|\/)/i;
+const ATTRACTION_PRIORITY_NAME = /(museum|gallery|cathedral|church|palace|castle|historic|old\s*town|monument|opera|hofburg|stephans|belvedere|park|garden|platz|博物館|美術館|教堂|主教座堂|皇宮|宮|城堡|紀念|廣場|公園)/i;
+const ATTRACTION_DEPRIORITY_NAME = /(market|mall|shop|office|hospital|parking|playground|camping|hardware)/i;
 const ATTRACTION_TYPE_WHITELIST = new Set([
   'tourist_attraction',
   'museum',
@@ -358,6 +361,7 @@ function isQualifiedPlace(p: any, type: PlaceType, distKm: number) {
     if (type === 'museum' && reviews < MIN_MUSEUM_REVIEWS) return false;
     if (type === 'zoo' && ZOO_NAME_BLOCKLIST.test(name)) return false;
     if (type === 'zoo' && reviews < MIN_ZOO_REVIEWS) return false;
+    if (!ATTRACTION_PRIORITY_NAME.test(name) && reviews < 120) return false;
     return rating >= MIN_ATTRACTION_RATING && reviews >= MIN_ATTRACTION_REVIEWS;
   }
   if (FOOD_TYPES.includes(type)) {
@@ -471,7 +475,13 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
       const point = { lat: p.geometry.location.lat, lng: p.geometry.location.lng };
       const distKm = haversineKm(sample, point);
       if (!isQualifiedPlace(p, type, distKm)) continue;
-      const sc = scorePlace(p, distKm) * boost;
+      let qualityMul = 1;
+      if (ATTRACTION_TYPES.includes(type)) {
+        const nm = String(p.name || '');
+        if (ATTRACTION_PRIORITY_NAME.test(nm)) qualityMul *= 1.15;
+        if (ATTRACTION_DEPRIORITY_NAME.test(nm)) qualityMul *= 0.8;
+      }
+      const sc = scorePlace(p, distKm) * boost * qualityMul;
       const item = asPlaceOut(p, type, progressOf(point));
       if (!item) continue;
       const cur = byId.get(id);
@@ -747,39 +757,102 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
     return out;
   };
 
+  const legKm = (a?: PlaceOut, b?: PlaceOut) =>
+    a && b ? haversineKm({ lat: a.lat, lng: a.lng }, { lat: b.lat, lng: b.lng }) : 0;
+
+  const pickNearbyAttraction = (anchor: PlaceOut, deny: PlaceOut[] = []) => {
+    let best: PlaceOut | undefined;
+    let bestScore = -1;
+    for (const p of attractions) {
+      if (isBadAttractionName(p.name)) continue;
+      if (deny.some(x => similarAttraction(x, p))) continue;
+      const dist = legKm(anchor, p);
+      if (dist <= 0 || dist > MAX_ITINERARY_LEG_KM) continue;
+      const score = (p.rating || 0) / (1 + dist / 2.2);
+      if (score > bestScore) {
+        bestScore = score;
+        best = p;
+      }
+    }
+    if (best) usedAttractionGroupFinal.add(attractionGroupKey(best));
+    return best;
+  };
+
+  const pickNearbyRestaurant = (anchor: PlaceOut) => {
+    let best: PlaceOut | undefined;
+    let bestScore = -1;
+    for (const r of restaurants) {
+      const k = restaurantKey(r);
+      if (usedLunchKeysFinal.has(k)) continue;
+      const dist = legKm(anchor, r);
+      if (dist <= 0 || dist > MAX_ITINERARY_LEG_KM) continue;
+      const score = (r.rating || 0) / (1 + dist / 2.2);
+      if (score > bestScore) {
+        bestScore = score;
+        best = r;
+      }
+    }
+    return best;
+  };
+
+  const pickNearbyHotel = (anchor: PlaceOut) => {
+    let best: PlaceOut | undefined;
+    let bestScore = -1;
+    for (const h of hotels) {
+      const dist = legKm(anchor, h);
+      if (dist <= 0 || dist > MAX_ITINERARY_LEG_KM) continue;
+      const score = (h.rating || 0) / (1 + dist / 2.2);
+      if (score > bestScore) {
+        bestScore = score;
+        best = h;
+      }
+    }
+    return best;
+  };
+
   for (let d = 0; d < days; d++) {
     const day = itinerary[d];
     day.morning = dedupAttractionList(day.morning, attractions, [], 2);
     day.afternoon = dedupAttractionList(day.afternoon, attractions, day.morning, 2);
 
+    if (d > 0 && itinerary[d - 1].lodging && day.morning[0] && legKm(itinerary[d - 1].lodging, day.morning[0]) > MAX_ITINERARY_LEG_KM) {
+      const repl = pickNearbyAttraction(itinerary[d - 1].lodging, [...day.morning.slice(1), ...day.afternoon]);
+      if (repl) day.morning[0] = repl;
+    }
+
+    if (day.morning[0] && day.morning[1] && legKm(day.morning[0], day.morning[1]) > MAX_ITINERARY_LEG_KM) {
+      const repl = pickNearbyAttraction(day.morning[0], [day.morning[0], ...day.afternoon]);
+      if (repl) day.morning[1] = repl;
+    }
+
+    const lunchAnchor = day.morning[day.morning.length - 1] || day.afternoon[0];
     if (day.lunch) {
       const k = restaurantKey(day.lunch);
       const badFood = FOOD_NAME_BLOCKLIST.test(day.lunch.name || '') || HOTEL_BRAND_IN_FOOD_BLOCKLIST.test(day.lunch.name || '');
-      if (badFood || usedLunchKeysFinal.has(k)) day.lunch = undefined;
-      else usedLunchKeysFinal.add(k);
+      if (badFood || usedLunchKeysFinal.has(k) || (lunchAnchor && legKm(lunchAnchor, day.lunch) > MAX_ITINERARY_LEG_KM)) {
+        day.lunch = undefined;
+      }
+    }
+    if (!day.lunch && lunchAnchor) {
+      const repl = pickNearbyRestaurant(lunchAnchor);
+      if (repl) day.lunch = repl;
+    }
+    if (day.lunch) usedLunchKeysFinal.add(restaurantKey(day.lunch));
+
+    const aftAnchor = day.lunch || day.morning[day.morning.length - 1];
+    if (aftAnchor && day.afternoon[0] && legKm(aftAnchor, day.afternoon[0]) > MAX_ITINERARY_LEG_KM) {
+      const repl = pickNearbyAttraction(aftAnchor, [...day.morning, day.afternoon[1]].filter(Boolean) as PlaceOut[]);
+      if (repl) day.afternoon[0] = repl;
+    }
+    if (day.afternoon[0] && day.afternoon[1] && legKm(day.afternoon[0], day.afternoon[1]) > MAX_ITINERARY_LEG_KM) {
+      const repl = pickNearbyAttraction(day.afternoon[0], [...day.morning, day.afternoon[0]]);
+      if (repl) day.afternoon[1] = repl;
     }
 
-    if (!day.lunch) {
-      const anchors = [...day.morning, ...day.afternoon];
-      const cx = anchors.length ? anchors.reduce((s, p) => s + p.lat, 0) / anchors.length : 0;
-      const cy = anchors.length ? anchors.reduce((s, p) => s + p.lng, 0) / anchors.length : 0;
-      let bestR: PlaceOut | undefined;
-      let bestScore = -1;
-      for (const r of restaurants) {
-        const k = restaurantKey(r);
-        if (usedLunchKeysFinal.has(k)) continue;
-        const dist = anchors.length ? haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) : 0;
-        if (dist > 8) continue;
-        const sc = (r.rating || 0) / (1 + dist / 6);
-        if (sc > bestScore) {
-          bestScore = sc;
-          bestR = r;
-        }
-      }
-      if (bestR) {
-        day.lunch = bestR;
-        usedLunchKeysFinal.add(restaurantKey(bestR));
-      }
+    const stayAnchor = day.afternoon[day.afternoon.length - 1] || day.morning[day.morning.length - 1];
+    if (stayAnchor && day.lodging && legKm(stayAnchor, day.lodging) > MAX_ITINERARY_LEG_KM) {
+      const repl = pickNearbyHotel(stayAnchor);
+      if (repl) day.lodging = repl;
     }
   }
   return itinerary;

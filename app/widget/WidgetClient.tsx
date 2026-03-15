@@ -13,7 +13,7 @@ type POI = {
   lng: number;
   address?: string;
   rating?: number;
-  _type?: 'tourist_attraction' | 'restaurant' | 'lodging' | string;
+  _type?: 'tourist_attraction' | 'restaurant' | 'lodging' | 'park' | 'museum' | 'zoo' | 'aquarium' | 'amusement_park' | 'place_of_worship' | string;
   place_id?: string;
 };
 
@@ -33,6 +33,7 @@ type PlanResponse = {
   durationText: string;
   pois: POI[];          // 候選點池（保留）
   itinerary: DaySlot[]; // ✅ 實際行程
+  routeMode?: 'driving' | 'long_haul_fallback' | string;
 };
 
 /* ======================= UI ======================= */
@@ -112,14 +113,20 @@ function userBluePinIcon(): google.maps.Icon {
   };
 }
 
-// 依類型回傳彩色圖示
+// 依類型回傳彩色圖示（擴充所有常見類型）
 function iconByType(t?: string): google.maps.Icon {
-  // 顏色：景點=綠(#10B981/#065F46)，餐廳=橘(#F59E0B/#92400E)，住宿=紫(#8B5CF6/#5B21B6)，其他=紅(#EF4444/#991B1B)
-  const color =
-    t === 'tourist_attraction' ? { fill: '#10B981', stroke: '#065F46' } :
-    t === 'restaurant'         ? { fill: '#F59E0B', stroke: '#92400E' } :
-    t === 'lodging'            ? { fill: '#8B5CF6', stroke: '#5B21B6' } :
-                                 { fill: '#EF4444', stroke: '#991B1B' };
+  const palette: Record<string, { fill: string; stroke: string }> = {
+    tourist_attraction: { fill: '#10B981', stroke: '#065F46' }, // 綠
+    restaurant:         { fill: '#F59E0B', stroke: '#92400E' }, // 橘
+    lodging:            { fill: '#8B5CF6', stroke: '#5B21B6' }, // 紫
+    park:               { fill: '#22C55E', stroke: '#166534' }, // 亮綠
+    museum:             { fill: '#0EA5E9', stroke: '#075985' }, // 藍
+    zoo:                { fill: '#84CC16', stroke: '#3F6212' }, // 落葉綠
+    aquarium:           { fill: '#38BDF8', stroke: '#0C4A6E' }, // 湖藍
+    amusement_park:     { fill: '#F97316', stroke: '#7C2D12' }, // 橘紅
+    place_of_worship:   { fill: '#E11D48', stroke: '#7F1D1D' }, // 朱紅
+  };
+  const color = palette[t || ''] || { fill: '#EF4444', stroke: '#991B1B' }; // 其他=紅
 
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24">` +
@@ -158,18 +165,36 @@ function fmtDistance(km: number) {
   return km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
 }
 
-// 小徽章：型別 → 標籤 & 樣式
+// 類型中文標籤
 function typeLabel(t?: string) {
-  if (t === 'restaurant') return '餐廳';
-  if (t === 'lodging') return '住宿';
-  if (t === 'tourist_attraction') return '景點';
-  return null;
+  switch (t) {
+    case 'restaurant':         return '餐廳';
+    case 'lodging':            return '住宿';
+    case 'tourist_attraction': return '景點';
+    case 'park':               return '公園/花園';
+    case 'museum':             return '博物館';
+    case 'zoo':                return '動物園';
+    case 'aquarium':           return '水族館';
+    case 'amusement_park':     return '遊樂園';
+    case 'place_of_worship':   return '宮廟/寺院';
+    default:                   return null;
+  }
 }
+
+// 類型徽章樣式
 function typeBadgeClass(t?: string) {
-  if (t === 'restaurant') return 'bg-rose-50 text-rose-700 border-rose-200';
-  if (t === 'lodging') return 'bg-indigo-50 text-indigo-700 border-indigo-200';
-  if (t === 'tourist_attraction') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
-  return 'bg-slate-50 text-slate-700 border-slate-200';
+  switch (t) {
+    case 'restaurant':         return 'bg-rose-50 text-rose-700 border-rose-200';
+    case 'lodging':            return 'bg-indigo-50 text-indigo-700 border-indigo-200';
+    case 'tourist_attraction': return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+    case 'park':               return 'bg-green-50 text-green-700 border-green-200';
+    case 'museum':             return 'bg-sky-50 text-sky-700 border-sky-200';
+    case 'zoo':                return 'bg-lime-50 text-lime-700 border-lime-200';
+    case 'aquarium':           return 'bg-cyan-50 text-cyan-700 border-cyan-200';
+    case 'amusement_park':     return 'bg-orange-50 text-orange-700 border-orange-200';
+    case 'place_of_worship':   return 'bg-red-50 text-red-700 border-red-200';
+    default:                   return 'bg-slate-50 text-slate-700 border-slate-200';
+  }
 }
 
 // 把 DaySlot 攤平成「依造訪順序排列」的陣列（早 → 午餐 → 下午 → 住宿）
@@ -188,21 +213,22 @@ export default function WidgetClient() {
   // Map refs
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInst = useRef<google.maps.Map | null>(null);
-  const routePolylineRef = useRef<google.maps.Polyline | null>(null); // 路線折線
-  const routeMarkersRef = useRef<google.maps.Marker[]>([]); // S/E 兩點
-  const poiMarkersRef = useRef<google.maps.Marker[]>([]); // ✅ 行程（itinerary）用到的點
-  const nearbyMarkersRef = useRef<google.maps.Marker[]>([]); // 附近探索（紅色）標記
-  const userMarkerRef = useRef<google.maps.Marker | null>(null); // 目前位置（藍色針）
-  const customCenterMarkerRef = useRef<google.maps.Marker | null>(null); // 自訂搜尋中心
-  const searchCircleRef = useRef<google.maps.Circle | null>(null); // 搜尋範圍圓（藍系）
+  const routePolylineRef = useRef<google.maps.Polyline | null>(null);
+  const routeMarkersRef = useRef<google.maps.Marker[]>([]);
+  const poiMarkersRef = useRef<google.maps.Marker[]>([]); // ✅ itinerary 用標記
+  const nearbyMarkersRef = useRef<google.maps.Marker[]>([]);
+  const userMarkerRef = useRef<google.maps.Marker | null>(null);
+  const customCenterMarkerRef = useRef<google.maps.Marker | null>(null);
+  const searchCircleRef = useRef<google.maps.Circle | null>(null);
   const mapIdleListenerRef = useRef<google.maps.MapsEventListener | null>(null);
   const mapClickListenerRef = useRef<google.maps.MapsEventListener | null>(null);
   const watchIdRef = useRef<number | null>(null);
-  const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null); // 共用 InfoWindow
-  const routeStartRef = useRef<{ lat: number; lng: number } | null>(null); // 記住整體起點
+  const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null);
+  const routeStartRef = useRef<{ lat: number; lng: number } | null>(null);
+  const routeModeRef = useRef<string>('driving');
 
   // 自訂搜尋中心
-  const [centerInput, setCenterInput] = useState(''); // 可輸入座標或景點/地址
+  const [centerInput, setCenterInput] = useState('');
   const centerInputRef = useRef<HTMLInputElement | null>(null);
   const [pickOnMap, setPickOnMap] = useState(false);
 
@@ -221,13 +247,13 @@ export default function WidgetClient() {
     end: string;
   } | null>(null);
 
-  // ✅ 以 DaySlot[] 取代舊的 DayPlan[]
+  // ✅ DaySlot[]
   const [plan, setPlan] = useState<DaySlot[]>([]);
 
   // Nearby controls
   const [types, setTypes] = useState<string[]>(['tourist_attraction', 'restaurant']);
-  const [radius, setRadius] = useState(1500);             // 實際半徑（number）
-  const [radiusInput, setRadiusInput] = useState('1500'); // 顯示用字串（允許清空）
+  const [radius, setRadius] = useState(1500);
+  const [radiusInput, setRadiusInput] = useState('1500');
   const [keyword, setKeyword] = useState('');
   const [showCircle, setShowCircle] = useState(true);
   const [autoUpdateOnDrag, setAutoUpdateOnDrag] = useState(true);
@@ -393,6 +419,7 @@ export default function WidgetClient() {
 
       // 記住整體起點座標（供距離計算）
       routeStartRef.current = { lat: data.start.lat, lng: data.start.lng };
+      routeModeRef.current = data.routeMode || 'driving';
 
       // ✅ 使用後端的 itinerary
       setPlan(data.itinerary || []);
@@ -994,13 +1021,16 @@ export default function WidgetClient() {
                 {plan.map((day, dayIdx) => {
                   // 將今天的順序展開：上午(1–2) → 午餐(1) → 下午(1–2) → 住宿(1)
                   const seq = flattenDaySequence(day);
+                  const useRouteStartAsDay1Anchor = routeModeRef.current !== 'long_haul_fallback';
 
                   // 計算本日距離
                   let dailyTotalKm = 0;
                   for (let i = 0; i < seq.length; i++) {
                     const prev =
                       i === 0
-                        ? (dayIdx === 0 ? routeStartRef.current : (plan[dayIdx - 1]?.lodging || plan[dayIdx - 1]?.afternoon?.slice(-1)[0] || plan[dayIdx - 1]?.morning?.slice(-1)[0])) as any
+                        ? (dayIdx === 0
+                            ? (useRouteStartAsDay1Anchor ? routeStartRef.current : null)
+                            : (plan[dayIdx - 1]?.lodging || plan[dayIdx - 1]?.afternoon?.slice(-1)[0] || plan[dayIdx - 1]?.morning?.slice(-1)[0]) as any)
                         : seq[i - 1];
                     if (prev) dailyTotalKm += haversineKm({ lat: prev.lat, lng: prev.lng }, { lat: seq[i].lat, lng: seq[i].lng });
                   }
@@ -1032,7 +1062,7 @@ export default function WidgetClient() {
                   const m1 = day.morning?.[1];
                   const anchorMorning0 =
                     dayIdx === 0
-                      ? routeStartRef.current || undefined
+                      ? (useRouteStartAsDay1Anchor ? routeStartRef.current || undefined : undefined)
                       : (plan[dayIdx - 1]?.lodging || plan[dayIdx - 1]?.afternoon?.slice(-1)[0] || plan[dayIdx - 1]?.morning?.slice(-1)[0]) as any;
                   const anchorMorning1 = m0;
                   const anchorLunch = day.morning?.slice(-1)[0];

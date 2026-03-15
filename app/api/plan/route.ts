@@ -1233,13 +1233,40 @@ export async function POST(req: NextRequest) {
     if (hasGoogle) {
       let r: DirectionsInfo;
       let longHaulFallback = false;
+      const sameToken = normalizeLocationToken(origin) === normalizeLocationToken(destination);
+      let resolvedOrigin: { lat: number; lng: number; formatted_address?: string } | null = null;
+      let resolvedDestination: { lat: number; lng: number; formatted_address?: string } | null = null;
+
+      if (!sameToken) {
+        try {
+          const [oGeo, dGeo] = await Promise.all([
+            geocodeAny(origin, locale.lang, routingRegion),
+            geocodeAny(destination, locale.lang, routingRegion),
+          ]);
+          const preCrow = haversineKm(
+            { lat: oGeo.lat, lng: oGeo.lng },
+            { lat: dGeo.lat, lng: dGeo.lng },
+          );
+          if (preCrow >= INTERCITY_SUPPLEMENT_KM) {
+            resolvedOrigin = oGeo;
+            resolvedDestination = dGeo;
+          }
+        } catch {
+          // Keep text-based routing if pre-geocoding is unavailable.
+        }
+      }
+
       try {
-        r = await directionsGoogle(origin, destination, locale.lang, routingRegion);
+        const originForDirections = resolvedOrigin ? `${resolvedOrigin.lat},${resolvedOrigin.lng}` : origin;
+        const destinationForDirections = resolvedDestination ? `${resolvedDestination.lat},${resolvedDestination.lng}` : destination;
+        const directionRegion = resolvedOrigin && resolvedDestination ? '' : routingRegion;
+        r = await directionsGoogle(originForDirections, destinationForDirections, locale.lang, directionRegion);
+        if (resolvedOrigin?.formatted_address) r.start.address = resolvedOrigin.formatted_address;
+        if (resolvedDestination?.formatted_address) r.end.address = resolvedDestination.formatted_address;
 
         // If raw text directions collapses two different city names into the same city,
         // re-run with geocoded coordinates to avoid ambiguous place-name routing.
-        const sameToken = normalizeLocationToken(origin) === normalizeLocationToken(destination);
-        if (!sameToken) {
+        if (!sameToken && !(resolvedOrigin && resolvedDestination)) {
           const rawCrow = haversineKm(
             { lat: r.start.lat, lng: r.start.lng },
             { lat: r.end.lat, lng: r.end.lng },
@@ -1253,6 +1280,8 @@ export async function POST(req: NextRequest) {
                 { lat: dGeo.lat, lng: dGeo.lng },
               );
               if (geoCrow >= INTERCITY_SUPPLEMENT_KM) {
+                resolvedOrigin = oGeo;
+                resolvedDestination = dGeo;
                 r = await directionsGoogle(
                   `${oGeo.lat},${oGeo.lng}`,
                   `${dGeo.lat},${dGeo.lng}`,
@@ -1270,8 +1299,8 @@ export async function POST(req: NextRequest) {
       } catch (e: any) {
         const code = e?.code || e?.message;
         if (code === 'ZERO_RESULTS' || code === 'NOT_FOUND' || code === 'REQUEST_DENIED' || code === 'INVALID_REQUEST' || code === 'OVER_DAILY_LIMIT') {
-          const o = await geocodeAny(origin, locale.lang, routingRegion);
-          const d = await geocodeAny(destination, locale.lang, routingRegion);
+          const o = resolvedOrigin || await geocodeAny(origin, locale.lang, routingRegion);
+          const d = resolvedDestination || await geocodeAny(destination, locale.lang, routingRegion);
           const startLL = { lat: o.lat, lng: o.lng };
           const endLL = { lat: d.lat, lng: d.lng };
           const distanceKm = haversineKm(startLL, endLL);
@@ -1290,8 +1319,12 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      const startLL = { lat: r.start.lat, lng: r.start.lng };
-      const endLL = { lat: r.end.lat, lng: r.end.lng };
+      const startLL = resolvedOrigin
+        ? { lat: resolvedOrigin.lat, lng: resolvedOrigin.lng }
+        : { lat: r.start.lat, lng: r.start.lng };
+      const endLL = resolvedDestination
+        ? { lat: resolvedDestination.lat, lng: resolvedDestination.lng }
+        : { lat: r.end.lat, lng: r.end.lng };
       const crowKm = haversineKm(startLL, endLL);
       const isSingle = crowKm <= NEAR_EQ_KM;
       const isLongHaul = longHaulFallback || crowKm >= LONG_HAUL_KM;
@@ -1323,8 +1356,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({
         provider: 'google',
         polyline: toPolylineArray(r.polyPts),
-        start: { lat: r.start.lat, lng: r.start.lng, address: r.start.address },
-        end: { lat: r.end.lat, lng: r.end.lng, address: r.end.address },
+        start: { lat: startLL.lat, lng: startLL.lng, address: resolvedOrigin?.formatted_address || r.start.address },
+        end: { lat: endLL.lat, lng: endLL.lng, address: resolvedDestination?.formatted_address || r.end.address },
         distanceText: r.distanceText,
         durationText: r.durationText,
         pois: slimPoisForResponse(pois, itinerary),

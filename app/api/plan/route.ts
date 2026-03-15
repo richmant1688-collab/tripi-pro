@@ -60,6 +60,7 @@ const ATTRACTION_KEYWORD_LIMIT = 1;
 const MAX_RESPONSE_POIS = 40;
 const MAX_RESPONSE_POLYLINE_POINTS = 120;
 const LONG_HAUL_KM = 1200;
+const INTERCITY_SUPPLEMENT_KM = 90;
 const LONG_HAUL_LOCAL_LAT_SPAN = 0.03;
 const LONG_HAUL_LOCAL_LNG_SPAN = 0.02;
 const MIN_ATTRACTION_RATING = 3.8;
@@ -344,6 +345,8 @@ function expandGeocodeQueries(input: string): string[] {
     '臺北': ['臺北', '台北', 'Taipei', 'Taipei City'],
     '維也納': ['維也納', '维也纳', 'Vienna', 'Wien'],
     '维也纳': ['维也纳', '維也納', 'Vienna', 'Wien'],
+    '布達佩斯': ['布達佩斯', '布达佩斯', 'Budapest'],
+    '布达佩斯': ['布达佩斯', '布達佩斯', 'Budapest'],
   };
 
   const out = new Set<string>();
@@ -1090,6 +1093,42 @@ function slimPoisForResponse(pois: PlaceOut[], itinerary: DaySlot[], limit = MAX
   return out;
 }
 
+function remapProgressBand(pois: PlaceOut[], minProgress: number, maxProgress: number): PlaceOut[] {
+  const lo = Math.max(0, Math.min(1, minProgress));
+  const hi = Math.max(lo, Math.min(1, maxProgress));
+  const span = hi - lo;
+  return pois.map((p, idx) => {
+    const fallback = pois.length <= 1 ? 0.5 : idx / Math.max(1, pois.length - 1);
+    const base = typeof p.progress === 'number' ? p.progress : fallback;
+    const clamped = Math.max(0, Math.min(1, base));
+    return { ...p, progress: lo + clamped * span };
+  });
+}
+
+function mergePoisPreferQuality(...groups: PlaceOut[][]): PlaceOut[] {
+  const keyOf = (p: PlaceOut) => {
+    if (p.place_id) return `pid:${p.place_id}`;
+    const nm = (p.name || '').toLowerCase().replace(/[^a-z0-9\u00c0-\u024f\u4e00-\u9fff]+/g, '');
+    return `nm:${nm}@${p.lat.toFixed(4)},${p.lng.toFixed(4)}`;
+  };
+  const quality = (p: PlaceOut) => (p.rating || 0) * 100 + Math.log10((p.user_ratings_total || 0) + 1) * 10;
+
+  const merged = new Map<string, PlaceOut>();
+  for (const list of groups) {
+    for (const p of list) {
+      const k = keyOf(p);
+      const cur = merged.get(k);
+      if (!cur || quality(p) > quality(cur)) merged.set(k, p);
+    }
+  }
+
+  return Array.from(merged.values()).sort((a, b) => {
+    const pa = a.progress ?? 0;
+    const pb = b.progress ?? 0;
+    return pa - pb || (b.rating ?? 0) - (a.rating ?? 0);
+  });
+}
+
 function buildDestinationLocalPath(center: LatLng): LatLng[] {
   const ring = [
     { lat: center.lat + LONG_HAUL_LOCAL_LAT_SPAN, lng: center.lng },
@@ -1156,11 +1195,18 @@ async function routeOSRM(origin: LatLng, dest: LatLng) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { origin, destination, days = 5, lang: bodyLang, region: bodyRegion } = body || {};
+    const { origin, destination, days, lang: bodyLang, region: bodyRegion } = body || {};
+    const tripDays = Number(days);
     const locale = resolveLocale(req, bodyLang, bodyRegion);
     if (!origin || !destination) {
       return NextResponse.json(
         { error: 'bad_request', detail: 'origin/destination required' },
+        { status: 400, headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
+    if (!Number.isInteger(tripDays) || tripDays < 1 || tripDays > 14) {
+      return NextResponse.json(
+        { error: 'bad_request', detail: 'days must be an integer between 1 and 14' },
         { status: 400, headers: { 'Cache-Control': 'no-store' } }
       );
     }
@@ -1209,10 +1255,20 @@ export async function POST(req: NextRequest) {
         // For cross-country routes, plan activities around destination city.
         pois = await harvestPOIsAlongPath(buildDestinationLocalPath(endLL), locale.lang);
       } else {
-        pois = await harvestPOIsAlongPath(r.polyPts, locale.lang);
+        const needDestinationSupplement = crowKm >= INTERCITY_SUPPLEMENT_KM && tripDays >= 3;
+        if (needDestinationSupplement) {
+          const [routePois, destPoisRaw] = await Promise.all([
+            harvestPOIsAlongPath(r.polyPts, locale.lang),
+            harvestPOIsAlongPath(buildDestinationLocalPath(endLL), locale.lang),
+          ]);
+          const destPois = remapProgressBand(destPoisRaw, 0.62, 0.98);
+          pois = mergePoisPreferQuality(routePois, destPois);
+        } else {
+          pois = await harvestPOIsAlongPath(r.polyPts, locale.lang);
+        }
       }
 
-      const itinerary = buildAgencyStyleItinerary(pois, days);
+      const itinerary = buildAgencyStyleItinerary(pois, tripDays);
       await enrichChosenPOIsWithCity(itinerary, pois, locale.lang);
 
       return NextResponse.json({

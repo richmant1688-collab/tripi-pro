@@ -233,6 +233,7 @@ function extractCityDistrict(components: any[]): { city?: string; district?: str
 
 /** 銋暹楊?唳??腦撣?/ 銵???蝵桀?啣?嚗??銴＊蝷?*/
 function formatAddressWithCity(address?: string, city?: string, district?: string) {
+  const SEP = ' · ';
   const parts: string[] = [];
   const clean = (s: string) => s.replace(/\s+/g, ' ').trim();
 
@@ -240,17 +241,17 @@ function formatAddressWithCity(address?: string, city?: string, district?: strin
   if (district) parts.push(district);
 
   let rest = address ? clean(address) : '';
-  const head = parts.join(' 繚 ');
+  const head = parts.join(SEP);
 
   if (rest) {
-    const rmRaw = [city, district].filter(Boolean).join('|');
-    if (rmRaw) {
-      const rm = rmRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      rest = rest.replace(new RegExp(`^(${rm})(\\s*繚\\s*)?`, 'u'), '');
-    }
+      const rmRaw = [city, district].filter(Boolean).join('|');
+      if (rmRaw) {
+        const rm = rmRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      rest = rest.replace(new RegExp(`^(${rm})(\\s*(?:·|繚)\\s*)?`, 'u'), '');
+      }
   }
 
-  return head ? (rest ? `${head} 繚 ${rest}` : head) : (rest || '');
+  return head ? (rest ? `${head}${SEP}${rest}` : head) : (rest || '');
 }
 
 /** ---------------- Google APIs ---------------- */
@@ -531,6 +532,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
   const normName = (s?: string) => (s || '').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
   const attractionGroupKey = (p: PlaceOut) => {
     const n = normName(p.name)
+      .replace(/博物館|美術館|花園|公園|教堂|廣場|城堡|景點|雕像/g, '')
       .replace(/museum|gallery|park|garden|cathedral|church|palace|schloss|platz|vienna|wien/g, '');
     return n.slice(0, 12) || normName(p.name).slice(0, 12);
   };
@@ -551,6 +553,8 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
     .filter(p => !FOOD_NAME_BLOCKLIST.test(p.name || ''));
   const hotels = pois.filter(p => HOTEL_TYPES.includes(p._type as any));
   const allowCrossDayRepeat = attractions.length < days * 4;
+  const allowRestaurantRepeat = restaurants.length < days;
+  const allowHotelRepeat = hotels.length < days;
 
   const usedAttractions = new Set<string>();
   const usedRestaurants = new Set<string>();
@@ -563,7 +567,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       if (out.length >= need) break;
       const id = idOf(p);
       if (dayPicked.has(id) || usedAttractions.has(id)) continue;
-      if (dayItems.some(x => similarAttraction(x, p))) continue;
+      if ([...dayItems, ...out].some(x => similarAttraction(x, p))) continue;
       out.push(p);
       dayPicked.add(id);
       usedAttractions.add(id);
@@ -574,7 +578,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       const id = idOf(p);
       if (dayPicked.has(id)) continue;
       if (!allowCrossDayRepeat && usedAttractions.has(id)) continue;
-      if (dayItems.some(x => similarAttraction(x, p))) continue;
+      if ([...dayItems, ...out].some(x => similarAttraction(x, p))) continue;
       out.push(p);
       dayPicked.add(id);
     }
@@ -626,6 +630,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       }
       if (!bestR) {
         for (const r of restaurants) {
+          if (!allowRestaurantRepeat && usedRestaurants.has(idOf(r))) continue;
           const sc = (r.rating || 0) / (1 + haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) / 6);
           if (sc > bestScore) {
             bestScore = sc;
@@ -654,6 +659,7 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       }
       if (!bestH) {
         for (const h of hotels) {
+          if (!allowHotelRepeat && usedHotels.has(idOf(h))) continue;
           const sc = (h.rating || 0) / (1 + haversineKm({ lat: anchor.lat, lng: anchor.lng }, { lat: h.lat, lng: h.lng }) / 6);
           if (sc > bestScore) {
             bestScore = sc;

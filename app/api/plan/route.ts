@@ -73,7 +73,7 @@ const MIN_MUSEUM_REVIEWS = 80;
 const MIN_ZOO_REVIEWS = 200;
 const MAX_POI_DIST_FROM_SAMPLE_KM = 15;
 const NEAR_DUP_KM = 0.35;
-const HARD_NEAR_DUP_KM = 0.18;
+const HARD_NEAR_DUP_KM = 0.30;
 const MAX_ITINERARY_LEG_KM = 3.5;
 const FOOD_NAME_BLOCKLIST = /(hotel|hostel|apartment|apartments|resort|inn|motel|wohnung|\u9152\u5e97|\u98ef\u5e97|\u65c5\u9928|\u65c5\u5e97|\u6c11\u5bbf)/i;
 const HOTEL_BRAND_IN_FOOD_BLOCKLIST = /(radisson|marriott|hilton|hyatt|intercontinental|holiday\s*inn|guesthouse|trend\s*hotel|trendhotel|wombat)/i;
@@ -398,8 +398,8 @@ function canonicalPlaceType(p: any, fallback: PlaceType): PlaceType {
   const types: string[] = Array.isArray(p?.types) ? p.types : [];
   if (types.includes('lodging')) return 'lodging';
   if (types.includes('restaurant') || types.includes('food') || types.includes('cafe') || types.includes('meal_takeaway')) return 'restaurant';
-  if (types.includes('museum') || types.includes('art_gallery')) return 'museum';
   if (types.includes('aquarium')) return 'aquarium';
+  if (types.includes('museum') || types.includes('art_gallery')) return 'museum';
   if (types.includes('zoo')) return 'zoo';
   if (types.includes('amusement_park')) return 'amusement_park';
   if (types.includes('park')) return 'park';
@@ -645,11 +645,22 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       .replace(/museum|gallery|park|garden|cathedral|church|palace|schloss|platz|vienna|wien/g, '');
     return n.slice(0, 12) || baseName.slice(0, 12);
   };
+  const addressKey = (p: PlaceOut) => {
+    const s = (p.address || '')
+      .toLowerCase()
+      .replace(/\d+/g, '')
+      .replace(/wien|vienna|österreich|osterreich/g, '')
+      .replace(/[^a-z\u00c0-\u024f\u4e00-\u9fff]+/g, '');
+    return s.slice(0, 18);
+  };
   const similarAttraction = (a: PlaceOut, b: PlaceOut) => {
     const na = normName(a.name), nb = normName(b.name);
     const nameClose = !!na && !!nb && (na.includes(nb) || nb.includes(na));
     const km = haversineKm({ lat: a.lat, lng: a.lng }, { lat: b.lat, lng: b.lng });
     if (km <= HARD_NEAR_DUP_KM) return true;
+    const aa = addressKey(a);
+    const bb = addressKey(b);
+    if (km <= 0.8 && aa && bb && aa === bb) return true;
     if (km <= 0.8 && attractionGroupKey(a) === attractionGroupKey(b)) return true;
     return km <= NEAR_DUP_KM && nameClose;
   };

@@ -59,6 +59,7 @@ const NEARBY_TIMEOUT_MS = 6000;
 const ATTRACTION_KEYWORD_LIMIT = 1;
 const MAX_RESPONSE_POIS = 40;
 const MAX_RESPONSE_POLYLINE_POINTS = 120;
+const LONG_HAUL_KM = 1200;
 /** 擴充的景點類型（古蹟、寺廟、步道、博物館、花園、遊樂園等） */
 const ATTRACTION_TYPES: PlaceType[] = [
   'tourist_attraction',
@@ -242,7 +243,11 @@ async function directionsGoogle(origin: string, destination: string): Promise<Di
   const key = process.env.GOOGLE_MAPS_API_KEY!;
   const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&language=${LANG}&region=${COUNTRY_REGION}&mode=driving&key=${key}`;
   const j = await fetchJson<any>(url);
-  if (j.status !== 'OK' || !j.routes?.[0]) throw new Error(j.error_message || j.status || 'directions_failed');
+  if (j.status !== 'OK' || !j.routes?.[0]) {
+    const err = new Error(j.error_message || j.status || 'directions_failed') as Error & { code?: string };
+    err.code = j.status;
+    throw err;
+  }
   const route = j.routes[0];
   const leg = route.legs[0];
   const pts = polyline.decode(route.overview_polyline.points).map(([lat, lng]: [number, number]) => ({ lat, lng }));
@@ -612,6 +617,19 @@ function slimPoisForResponse(pois: PlaceOut[], itinerary: DaySlot[], limit = MAX
   }
   return out;
 }
+
+function buildDestinationLocalPath(center: LatLng): LatLng[] {
+  const lat2 = Math.max(-85, Math.min(85, center.lat + (center.lat >= 0 ? 0.18 : -0.18)));
+  const lng2 = center.lng + 0.12;
+  return [center, { lat: lat2, lng: lng2 }];
+}
+
+function formatLongHaulDurationText(distanceKm: number) {
+  const hours = distanceKm / 800 + 1.5;
+  const h = Math.max(1, Math.floor(hours));
+  const m = Math.round((hours - h) * 60);
+  return `約 ${h} 小時 ${m} 分（跨國移動估算）`;
+}
 /** ---------------- OSM/OSRM fallback ---------------- */
 async function geocodeOSM(query: string) {
   const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&addressdetails=1`;
@@ -654,15 +672,44 @@ export async function POST(req: NextRequest) {
     const hasGoogle = !!process.env.GOOGLE_MAPS_API_KEY;
 
     if (hasGoogle) {
-      const r = await directionsGoogle(origin, destination);
+      let r: DirectionsInfo;
+      let longHaulFallback = false;
+      try {
+        r = await directionsGoogle(origin, destination);
+      } catch (e: any) {
+        const code = e?.code || e?.message;
+        if (code === 'ZERO_RESULTS' || code === 'NOT_FOUND') {
+          const o = await geocodeGoogle(origin);
+          const d = await geocodeGoogle(destination);
+          const startLL = { lat: o.lat, lng: o.lng };
+          const endLL = { lat: d.lat, lng: d.lng };
+          const distanceKm = haversineKm(startLL, endLL);
+          r = {
+            polyPts: [startLL, endLL],
+            start: { lat: startLL.lat, lng: startLL.lng, address: o.formatted_address || origin },
+            end: { lat: endLL.lat, lng: endLL.lng, address: d.formatted_address || destination },
+            distanceText: `${distanceKm.toFixed(0)} km`,
+            durationText: formatLongHaulDurationText(distanceKm),
+          };
+          longHaulFallback = true;
+        } else {
+          throw e;
+        }
+      }
+
       const startLL = { lat: r.start.lat, lng: r.start.lng };
       const endLL = { lat: r.end.lat, lng: r.end.lng };
-      const isSingle = haversineKm(startLL, endLL) <= NEAR_EQ_KM;
+      const crowKm = haversineKm(startLL, endLL);
+      const isSingle = crowKm <= NEAR_EQ_KM;
+      const isLongHaul = longHaulFallback || crowKm >= LONG_HAUL_KM;
 
       let pois: PlaceOut[] = [];
       if (isSingle) {
         const fakePath = [startLL, { lat: startLL.lat - 0.5, lng: startLL.lng + 0.2 }];
         pois = await harvestPOIsAlongPath(fakePath);
+      } else if (isLongHaul) {
+        // For cross-country routes, plan activities around destination city.
+        pois = await harvestPOIsAlongPath(buildDestinationLocalPath(endLL));
       } else {
         pois = await harvestPOIsAlongPath(r.polyPts);
       }
@@ -679,6 +726,7 @@ export async function POST(req: NextRequest) {
         durationText: r.durationText,
         pois: slimPoisForResponse(pois, itinerary),
         itinerary: itinerary.map(compactDaySlot),
+        routeMode: longHaulFallback ? 'long_haul_fallback' : 'driving',
       }, { headers: { 'Cache-Control': 'private, max-age=60' } });
     } else {
       const o = await geocodeOSM(origin), d = await geocodeOSM(destination);

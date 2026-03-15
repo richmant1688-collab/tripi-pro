@@ -78,7 +78,7 @@ const FOOD_NAME_BLOCKLIST = /(hotel|hostel|apartment|apartments|resort|inn|motel
 const HOTEL_BRAND_IN_FOOD_BLOCKLIST = /(radisson|marriott|hilton|hyatt|intercontinental|holiday\s*inn|guesthouse|trend\s*hotel|trendhotel|wombat)/i;
 const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach)/i;
 const PARK_NAME_BLOCKLIST = /(hundezone|dog\s*park|skate|parkplatz|parking)/i;
-const ZOO_NAME_BLOCKLIST = /(pet\s*shop|tierhandlung|aquaristik|zoo\s*shop|handlung|store)/i;
+const ZOO_NAME_BLOCKLIST = /(pet\s*shop|tierhandlung|aquaristik|zoo\s*shop|handlung|store|zoo\s*scharf|\/)/i;
 const ATTRACTION_TYPE_WHITELIST = new Set([
   'tourist_attraction',
   'museum',
@@ -132,6 +132,12 @@ const ATTRACTION_CN_KEYWORDS = [
   'landmark',
   'temple',
   'scenic',
+];
+const FOOD_KEYWORDS = [
+  'local food',
+  'traditional',
+  'bistro',
+  'viennese',
 ];
 
 /** ---------------- Utils ---------------- */
@@ -497,9 +503,15 @@ async function harvestPOIsAlongPath(path: LatLng[]) {
   for (const s of samples) {
     for (const t of FOOD_TYPES) {
       tasks.push(async () => {
-        const arr = await nearby(s, t, Math.max(3000, Math.round(radius * 0.5)));
+        const arr = await nearby(s, t, Math.max(3500, Math.round(radius * 0.6)));
         ingest(arr, t, s);
       });
+      for (const kw of FOOD_KEYWORDS) {
+        tasks.push(async () => {
+          const arr2 = await nearby(s, t, Math.max(3000, Math.round(radius * 0.5)), kw);
+          ingest(arr2, t, s, 1.03);
+        });
+      }
     }
   }
 
@@ -558,9 +570,10 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
     .filter(p => FOOD_TYPES.includes(p._type as any))
     .filter(p => !FOOD_NAME_BLOCKLIST.test(p.name || ''));
   const hotels = pois.filter(p => HOTEL_TYPES.includes(p._type as any));
-  const allowCrossDayRepeat = attractions.length < days * 4;
+  const allowCrossDayRepeat = attractions.length < days * 2;
 
   const usedAttractions = new Set<string>();
+  const usedAttractionSpots: PlaceOut[] = [];
   const usedRestaurants = new Set<string>();
   const usedHotels = new Set<string>();
 
@@ -571,10 +584,12 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       if (out.length >= need) break;
       const id = idOf(p);
       if (dayPicked.has(id) || usedAttractions.has(id)) continue;
+      if (!allowCrossDayRepeat && usedAttractionSpots.some(x => similarAttraction(x, p))) continue;
       if ([...dayItems, ...out].some(x => similarAttraction(x, p))) continue;
       out.push(p);
       dayPicked.add(id);
       usedAttractions.add(id);
+      usedAttractionSpots.push(p);
     }
 
     for (const p of candidates) {
@@ -582,9 +597,11 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       const id = idOf(p);
       if (dayPicked.has(id)) continue;
       if (!allowCrossDayRepeat && usedAttractions.has(id)) continue;
+      if (!allowCrossDayRepeat && usedAttractionSpots.some(x => similarAttraction(x, p))) continue;
       if ([...dayItems, ...out].some(x => similarAttraction(x, p))) continue;
       out.push(p);
       dayPicked.add(id);
+      usedAttractionSpots.push(p);
     }
     return out;
   };
@@ -636,15 +653,6 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
         for (const r of restaurants) {
           const id = idOf(r);
           if (usedRestaurants.has(id)) continue;
-          const sc = (r.rating || 0) / (1 + haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) / 6);
-          if (sc > bestScore) {
-            bestScore = sc;
-            bestR = r;
-          }
-        }
-      }
-      if (!bestR) {
-        for (const r of restaurants) {
           const sc = (r.rating || 0) / (1 + haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) / 6);
           if (sc > bestScore) {
             bestScore = sc;

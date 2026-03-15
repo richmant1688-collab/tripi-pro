@@ -343,10 +343,10 @@ function expandGeocodeQueries(input: string): string[] {
   const alias: Record<string, string[]> = {
     '台北': ['台北', '臺北', 'Taipei', 'Taipei City'],
     '臺北': ['臺北', '台北', 'Taipei', 'Taipei City'],
-    '維也納': ['維也納', '维也纳', 'Vienna', 'Wien'],
-    '维也纳': ['维也纳', '維也納', 'Vienna', 'Wien'],
-    '布達佩斯': ['布達佩斯', '布达佩斯', 'Budapest'],
-    '布达佩斯': ['布达佩斯', '布達佩斯', 'Budapest'],
+    '維也納': ['維也納', '维也纳', 'Vienna', 'Wien', 'Vienna, Austria'],
+    '维也纳': ['维也纳', '維也納', 'Vienna', 'Wien', 'Vienna, Austria'],
+    '布達佩斯': ['布達佩斯', '布达佩斯', 'Budapest', 'Budapest, Hungary'],
+    '布达佩斯': ['布达佩斯', '布達佩斯', 'Budapest', 'Budapest, Hungary'],
   };
 
   const out = new Set<string>();
@@ -356,6 +356,22 @@ function expandGeocodeQueries(input: string): string[] {
     if (alias[q]) alias[q].forEach(v => out.add(v));
   }
   return Array.from(out);
+}
+
+function normalizeLocationToken(input: string) {
+  return String(input || '')
+    .toLowerCase()
+    .replace(/[，。！？\s\-_,.]/g, '')
+    .replace(/(city|town|district|province|county|state|country|行程|旅遊|旅行|規劃|trip|travel|itinerary)/g, '');
+}
+
+function resolveRoutingRegion(region: string, origin: string, destination: string) {
+  const reg = String(region || '').toLowerCase();
+  if (!reg) return '';
+  const q = `${origin} ${destination}`.toLowerCase();
+  const twHints = /(台灣|臺灣|taiwan|台北|臺北|taipei|新北|桃園|台中|臺中|台南|臺南|高雄|基隆|新竹|嘉義|花蓮|台東|臺東|屏東|澎湖|金門|馬祖)/i;
+  if (twHints.test(q)) return reg;
+  return '';
 }
 
 async function geocodeAny(query: string, lang: string, region: string) {
@@ -1198,6 +1214,7 @@ export async function POST(req: NextRequest) {
     const { origin, destination, days, lang: bodyLang, region: bodyRegion } = body || {};
     const tripDays = Number(days);
     const locale = resolveLocale(req, bodyLang, bodyRegion);
+    const routingRegion = resolveRoutingRegion(locale.region, origin || '', destination || '');
     if (!origin || !destination) {
       return NextResponse.json(
         { error: 'bad_request', detail: 'origin/destination required' },
@@ -1217,12 +1234,44 @@ export async function POST(req: NextRequest) {
       let r: DirectionsInfo;
       let longHaulFallback = false;
       try {
-        r = await directionsGoogle(origin, destination, locale.lang, locale.region);
+        r = await directionsGoogle(origin, destination, locale.lang, routingRegion);
+
+        // If raw text directions collapses two different city names into the same city,
+        // re-run with geocoded coordinates to avoid ambiguous place-name routing.
+        const sameToken = normalizeLocationToken(origin) === normalizeLocationToken(destination);
+        if (!sameToken) {
+          const rawCrow = haversineKm(
+            { lat: r.start.lat, lng: r.start.lng },
+            { lat: r.end.lat, lng: r.end.lng },
+          );
+          if (rawCrow < INTERCITY_SUPPLEMENT_KM) {
+            try {
+              const oGeo = await geocodeAny(origin, locale.lang, routingRegion);
+              const dGeo = await geocodeAny(destination, locale.lang, routingRegion);
+              const geoCrow = haversineKm(
+                { lat: oGeo.lat, lng: oGeo.lng },
+                { lat: dGeo.lat, lng: dGeo.lng },
+              );
+              if (geoCrow >= INTERCITY_SUPPLEMENT_KM) {
+                r = await directionsGoogle(
+                  `${oGeo.lat},${oGeo.lng}`,
+                  `${dGeo.lat},${dGeo.lng}`,
+                  locale.lang,
+                  '',
+                );
+                r.start.address = oGeo.formatted_address || r.start.address;
+                r.end.address = dGeo.formatted_address || r.end.address;
+              }
+            } catch {
+              // Keep the original route if coordinate re-route fails.
+            }
+          }
+        }
       } catch (e: any) {
         const code = e?.code || e?.message;
         if (code === 'ZERO_RESULTS' || code === 'NOT_FOUND' || code === 'REQUEST_DENIED' || code === 'INVALID_REQUEST' || code === 'OVER_DAILY_LIMIT') {
-          const o = await geocodeAny(origin, locale.lang, locale.region);
-          const d = await geocodeAny(destination, locale.lang, locale.region);
+          const o = await geocodeAny(origin, locale.lang, routingRegion);
+          const d = await geocodeAny(destination, locale.lang, routingRegion);
           const startLL = { lat: o.lat, lng: o.lng };
           const endLL = { lat: d.lat, lng: d.lng };
           const distanceKm = haversineKm(startLL, endLL);

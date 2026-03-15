@@ -271,12 +271,16 @@ function formatAddressWithCity(address?: string, city?: string, district?: strin
 async function geocodeGoogle(query: string) {
   const key = process.env.GOOGLE_MAPS_API_KEY!;
   const base = 'https://maps.googleapis.com/maps/api/geocode/json';
+  let lastStatus = '';
+  let lastErr = '';
   const tryUrls = [
     `${base}?address=${encodeURIComponent(query)}&language=${LANG}&region=${COUNTRY_REGION}&key=${key}`,
     `${base}?address=${encodeURIComponent(query)}&language=${LANG}&key=${key}`,
   ];
   for (const url of tryUrls) {
     const j = await fetchJson<any>(url);
+    lastStatus = j.status || '';
+    lastErr = j.error_message || '';
     if (j.results?.[0]) {
       const g = j.results[0];
       return {
@@ -287,7 +291,27 @@ async function geocodeGoogle(query: string) {
       };
     }
   }
-  throw new Error('geocode_failed');
+  throw new Error(`geocode_failed:${lastStatus}${lastErr ? ':' + lastErr : ''}`);
+}
+
+async function geocodeAny(query: string) {
+  try {
+    const g = await geocodeGoogle(query);
+    return {
+      lat: g.lat,
+      lng: g.lng,
+      formatted_address: g.formatted_address,
+      components: g.components || [],
+    };
+  } catch {
+    const o = await geocodeOSM(query);
+    return {
+      lat: o.lat,
+      lng: o.lng,
+      formatted_address: o.formatted,
+      components: [],
+    };
+  }
 }
 
 async function reverseGeocodeGoogle(lat: number, lng: number) {
@@ -1031,9 +1055,9 @@ export async function POST(req: NextRequest) {
         r = await directionsGoogle(origin, destination);
       } catch (e: any) {
         const code = e?.code || e?.message;
-        if (code === 'ZERO_RESULTS' || code === 'NOT_FOUND') {
-          const o = await geocodeGoogle(origin);
-          const d = await geocodeGoogle(destination);
+        if (code === 'ZERO_RESULTS' || code === 'NOT_FOUND' || code === 'REQUEST_DENIED' || code === 'INVALID_REQUEST' || code === 'OVER_DAILY_LIMIT') {
+          const o = await geocodeAny(origin);
+          const d = await geocodeAny(destination);
           const startLL = { lat: o.lat, lng: o.lng };
           const endLL = { lat: d.lat, lng: d.lng };
           const distanceKm = haversineKm(startLL, endLL);

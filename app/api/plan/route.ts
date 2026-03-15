@@ -71,13 +71,14 @@ const MIN_HOTEL_REVIEWS = 20;
 const MIN_PARK_REVIEWS = 120;
 const MIN_MUSEUM_REVIEWS = 80;
 const MIN_ZOO_REVIEWS = 200;
+const MIN_TOURIST_ATTRACTION_REVIEWS = 180;
 const MAX_POI_DIST_FROM_SAMPLE_KM = 15;
 const NEAR_DUP_KM = 0.35;
 const HARD_NEAR_DUP_KM = 0.30;
 const MAX_ITINERARY_LEG_KM = 3.5;
 const FOOD_NAME_BLOCKLIST = /(hotel|hostel|apartment|apartments|resort|inn|motel|wohnung|\u9152\u5e97|\u98ef\u5e97|\u65c5\u9928|\u65c5\u5e97|\u6c11\u5bbf)/i;
 const HOTEL_BRAND_IN_FOOD_BLOCKLIST = /(radisson|marriott|hilton|hyatt|intercontinental|holiday\s*inn|guesthouse|trend\s*hotel|trendhotel|wombat)/i;
-const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach|zoo\s*scharf|michael\s*scharf|\bwuk\b|bo-yo|chocolate\s*museum)/i;
+const ATTRACTION_NAME_BLOCKLIST = /(sandbox\s*vr|hundezone|dog\s*park|fitness|gym|gedenktafel|memorial\s*plaque|flagship|camping|hardware|outlet|supermarket|hornbach|zoo\s*scharf|michael\s*scharf|\bwuk\b|bo-yo|chocolate\s*museum|water\s*world|brunnen)/i;
 const PARK_NAME_BLOCKLIST = /(hundezone|dog\s*park|skate|parkplatz|parking)/i;
 const ZOO_NAME_BLOCKLIST = /(pet\s*shop|tierhandlung|aquaristik|zoo\s*shop|handlung|store|zoo\s*scharf|\/)/i;
 const ATTRACTION_PRIORITY_NAME = /(museum|gallery|cathedral|church|palace|castle|historic|old\s*town|monument|opera|hofburg|stephans|belvedere|park|garden|platz|博物館|美術館|教堂|主教座堂|皇宮|宮|城堡|紀念|廣場|公園)/i;
@@ -434,6 +435,7 @@ function isQualifiedPlace(p: any, type: PlaceType, distKm: number) {
   if (ATTRACTION_TYPES.includes(effectiveType)) {
     if (!hasAnyGoogleType(p, ATTRACTION_TYPE_WHITELIST)) return false;
     if (primaryType && ATTRACTION_BAD_PRIMARY_TYPES.has(primaryType)) return false;
+    if (effectiveType === 'tourist_attraction' && reviews < MIN_TOURIST_ATTRACTION_REVIEWS) return false;
     if (effectiveType === 'park' && PARK_NAME_BLOCKLIST.test(name)) return false;
     if (effectiveType === 'park' && reviews < MIN_PARK_REVIEWS) return false;
     if (effectiveType === 'museum' && reviews < MIN_MUSEUM_REVIEWS) return false;

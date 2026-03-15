@@ -726,7 +726,62 @@ function buildAgencyStyleItinerary(pois: PlaceOut[], days: number): DaySlot[] {
       }
     }
   }
+  const usedAttractionGroupFinal = new Set<string>();
+  const usedLunchKeysFinal = new Set<string>();
+  const isBadAttractionName = (name?: string) => ATTRACTION_NAME_BLOCKLIST.test(String(name || '')) || ZOO_NAME_BLOCKLIST.test(String(name || ''));
+  const dedupAttractionList = (seed: PlaceOut[], fallback: PlaceOut[], deny: PlaceOut[] = [], need = 2) => {
+    const out: PlaceOut[] = [];
+    const denyAll = [...deny];
+    const tryPush = (p: PlaceOut) => {
+      if (out.length >= need) return;
+      if (isBadAttractionName(p.name)) return;
+      const gk = attractionGroupKey(p);
+      if (usedAttractionGroupFinal.has(gk)) return;
+      if (out.some(x => similarAttraction(x, p))) return;
+      if (denyAll.some(x => similarAttraction(x, p))) return;
+      out.push(p);
+      usedAttractionGroupFinal.add(gk);
+    };
+    for (const p of seed) tryPush(p);
+    for (const p of fallback) tryPush(p);
+    return out;
+  };
 
+  for (let d = 0; d < days; d++) {
+    const day = itinerary[d];
+    day.morning = dedupAttractionList(day.morning, attractions, [], 2);
+    day.afternoon = dedupAttractionList(day.afternoon, attractions, day.morning, 2);
+
+    if (day.lunch) {
+      const k = restaurantKey(day.lunch);
+      const badFood = FOOD_NAME_BLOCKLIST.test(day.lunch.name || '') || HOTEL_BRAND_IN_FOOD_BLOCKLIST.test(day.lunch.name || '');
+      if (badFood || usedLunchKeysFinal.has(k)) day.lunch = undefined;
+      else usedLunchKeysFinal.add(k);
+    }
+
+    if (!day.lunch) {
+      const anchors = [...day.morning, ...day.afternoon];
+      const cx = anchors.length ? anchors.reduce((s, p) => s + p.lat, 0) / anchors.length : 0;
+      const cy = anchors.length ? anchors.reduce((s, p) => s + p.lng, 0) / anchors.length : 0;
+      let bestR: PlaceOut | undefined;
+      let bestScore = -1;
+      for (const r of restaurants) {
+        const k = restaurantKey(r);
+        if (usedLunchKeysFinal.has(k)) continue;
+        const dist = anchors.length ? haversineKm({ lat: cx, lng: cy }, { lat: r.lat, lng: r.lng }) : 0;
+        if (dist > 8) continue;
+        const sc = (r.rating || 0) / (1 + dist / 6);
+        if (sc > bestScore) {
+          bestScore = sc;
+          bestR = r;
+        }
+      }
+      if (bestR) {
+        day.lunch = bestR;
+        usedLunchKeysFinal.add(restaurantKey(bestR));
+      }
+    }
+  }
   return itinerary;
 }
 
